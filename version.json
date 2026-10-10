@@ -1,0 +1,6 @@
+{
+  "version": "1.6.0",
+  "package": "https://github.com/jodukkan-max/store-scrapper/releases/download/v1.6.0/store-scrapper.zip",
+  "requires": "5.0",
+  "tested": "6.6"
+}
