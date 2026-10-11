@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify tag matches the plugin header version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          HEADER=$(grep -m1 '^ \* Version:' shopify-woo-importer.php | sed 's/.*Version:[[:space:]]*//' | tr -d '[:space:]')
+          echo "tag=$TAG header=$HEADER"
+          if [ "$TAG" != "$HEADER" ]; then
+            echo "::error::Tag $TAG does not match the Version: header ($HEADER) in shopify-woo-importer.php."
+            echo "Bump the header and the SWI_VERSION constant, then retag."
+            exit 1
+          fi
+
+      # The zip must contain a single top-level `store-scrapper/` directory.
+      # WordPress installs the update into whatever directory the archive unpacks
+      # to, so any other name would move the plugin and deactivate it mid-update.
+      - name: Build plugin zip
+        run: |
+          mkdir -p build/store-scrapper
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='build' \
+            --exclude='.gitignore' \
+            ./ build/store-scrapper/
+          cd build && zip -r -q -X ../store-scrapper.zip store-scrapper
+
+      - name: Verify archive layout
+        run: |
+          TOP=$(unzip -Z1 store-scrapper.zip | cut -d/ -f1 | sort -u)
+          echo "top-level entries: $TOP"
+          if [ "$TOP" != "store-scrapper" ]; then
+            echo "::error::Archive must contain exactly one top-level directory named 'store-scrapper'."
+            exit 1
+          fi
+          unzip -l store-scrapper.zip | grep -q 'store-scrapper/shopify-woo-importer.php' || {
+            echo "::error::store-scrapper/shopify-woo-importer.php missing from the archive."
+            exit 1
+          }
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: store-scrapper.zip
+          generate_release_notes: true
+
+      # Rewrite version.json in `main` so existing installs see the update.
+      # The package URL is deterministic: /releases/download/v<TAG>/<zip>.
+      - name: Update version.json in main
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          python3 - <<PY
+          import json
+          with open('version.json', 'w') as f:
+              json.dump({
+                  "version": "${TAG}",
+                  "package": "https://github.com/jodukkan-max/store-scrapper/releases/download/v${TAG}/store-scrapper.zip",
+                  "requires": "5.0",
+                  "tested": "6.6",
+              }, f, indent=2)
+              f.write("\n")
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          git commit -m "chore: bump version.json to ${TAG}" || echo "version.json unchanged"
+          git push origin HEAD:main
