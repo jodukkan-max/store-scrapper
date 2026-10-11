@@ -64,28 +64,24 @@ class SWI_HTTP {
 				return new WP_Error( 'swi_ssrf', __( 'The URL could not be validated (unresolvable host or a blocked/private address).', 'swi' ) );
 			}
 
-			$args = array(
-				'timeout'     => $timeout,
-				'redirection' => 0, // Handled manually so each hop is re-validated.
-				'user-agent'  => self::USER_AGENT,
-				'sslverify'   => (bool) (int) SWI_Plugin::get_option( 'sslverify', 1 ),
-				'headers'     => array(
-					'Accept'          => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-					'Accept-Language' => 'en-US,en;q=0.9',
-				),
-			);
-
-			$response = wp_remote_get( $current, $args );
+			// Prefer a direct cURL request (HTTP/2) — Shopify throttles
+			// HTTP/1.1 requests from datacenter IPs ("429 local_rate_limited")
+			// but serves HTTP/2 normally. Fall back to wp_remote_get when the
+			// cURL extension is unavailable.
+			$response = self::curl_fetch( $current, $timeout );
+			if ( is_wp_error( $response ) && 'swi_curl_missing' === $response->get_error_code() ) {
+				$response = self::wp_fetch( $current, $timeout );
+			}
 
 			if ( is_wp_error( $response ) ) {
 				return $response;
 			}
 
-			$code = (int) wp_remote_retrieve_response_code( $response );
+			$code = (int) $response['code'];
 
 			// Redirect: resolve and re-validate the Location header, then loop.
 			if ( in_array( $code, array( 301, 302, 303, 307, 308 ), true ) ) {
-				$location = wp_remote_retrieve_header( $response, 'location' );
+				$location = self::header_value( $response['headers'], 'Location' );
 				if ( '' !== (string) $location ) {
 					$next = self::resolve_redirect( $current, (string) $location );
 					if ( is_wp_error( $next ) ) {
@@ -104,10 +100,134 @@ class SWI_HTTP {
 				);
 			}
 
-			return wp_remote_retrieve_body( $response );
+			return $response['body'];
 		}
 
 		return new WP_Error( 'swi_too_many_redirects', __( 'Too many redirects while fetching the URL.', 'swi' ) );
+	}
+
+	/**
+	 * Fetch one URL (a single hop) with cURL, negotiating HTTP/2.
+	 *
+	 * Returns the raw response header block (normalized to HTTP/1.1-style
+	 * lines by cURL) and the decompressed body, or a WP_Error.
+	 *
+	 * @param string $url     Absolute URL.
+	 * @param int    $timeout Request timeout in seconds.
+	 * @return array|WP_Error Array( 'code' => int, 'headers' => string, 'body' => string ).
+	 */
+	private static function curl_fetch( $url, $timeout = 30 ) {
+		if ( ! function_exists( 'curl_init' ) ) {
+			return new WP_Error( 'swi_curl_missing', __( 'cURL is not available.', 'swi' ) );
+		}
+
+		$sslverify = (bool) (int) SWI_Plugin::get_option( 'sslverify', 1 );
+
+		$ch = curl_init();
+		curl_setopt_array(
+			$ch,
+			array(
+				CURLOPT_URL            => $url,
+				CURLOPT_RETURNTRANSFER => true,
+				CURLOPT_HEADER         => true,
+				CURLOPT_FOLLOWLOCATION => false, // Redirects are handled manually for SSRF re-validation.
+				CURLOPT_CONNECTTIMEOUT => 10,
+				CURLOPT_TIMEOUT        => $timeout,
+				CURLOPT_USERAGENT      => self::USER_AGENT,
+				CURLOPT_SSL_VERIFYPEER => $sslverify,
+				CURLOPT_SSL_VERIFYHOST => $sslverify ? 2 : 0,
+				CURLOPT_ENCODING       => '', // Accept gzip/brotli; cURL decompresses the body.
+				CURLOPT_HTTPHEADER     => array(
+					'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+					'Accept-Language: en-US,en;q=0.9',
+				),
+			)
+		);
+
+		// Prefer HTTP/2 — Shopify serves it while throttling HTTP/1.1.
+		if ( defined( 'CURL_HTTP_VERSION_2TLS' ) ) {
+			curl_setopt( $ch, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS );
+		} elseif ( defined( 'CURL_HTTP_VERSION_2_0' ) ) {
+			curl_setopt( $ch, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0 );
+		}
+
+		$raw = curl_exec( $ch );
+
+		if ( false === $raw ) {
+			$errn = curl_errno( $ch );
+			$err  = curl_error( $ch );
+			curl_close( $ch );
+			return new WP_Error( 'swi_curl_' . $errn, ( '' !== $err ? $err : __( 'The cURL request failed.', 'swi' ) ) );
+		}
+
+		$code        = (int) curl_getinfo( $ch, CURLINFO_RESPONSE_CODE );
+		$header_size = (int) curl_getinfo( $ch, CURLINFO_HEADER_SIZE );
+		curl_close( $ch );
+
+		return array(
+			'code'    => $code,
+			'headers' => substr( $raw, 0, $header_size ),
+			'body'    => substr( $raw, $header_size ),
+		);
+	}
+
+	/**
+	 * Fallback fetch via WordPress's HTTP API (used only when cURL is missing).
+	 *
+	 * WordPress's cURL transport forces HTTP/1.1, so this may be rate-limited
+	 * by Shopify; it exists purely for hosts without the cURL extension.
+	 *
+	 * @param string $url     Absolute URL.
+	 * @param int    $timeout Request timeout in seconds.
+	 * @return array|WP_Error Array( 'code' => int, 'headers' => string, 'body' => string ).
+	 */
+	private static function wp_fetch( $url, $timeout = 30 ) {
+		$args = array(
+			'timeout'     => $timeout,
+			'redirection' => 0,
+			'user-agent'  => self::USER_AGENT,
+			'sslverify'   => (bool) (int) SWI_Plugin::get_option( 'sslverify', 1 ),
+			'headers'     => array(
+				'Accept'          => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+				'Accept-Language' => 'en-US,en;q=0.9',
+			),
+		);
+
+		$response = wp_remote_get( $url, $args );
+		if ( is_wp_error( $response ) ) {
+			return $response;
+		}
+
+		$raw_headers = '';
+		$headers_obj = wp_remote_retrieve_headers( $response );
+		if ( is_object( $headers_obj ) || is_array( $headers_obj ) ) {
+			foreach ( $headers_obj as $key => $value ) {
+				$raw_headers .= $key . ': ' . ( is_array( $value ) ? implode( ', ', $value ) : (string) $value ) . "\r\n";
+			}
+		}
+
+		return array(
+			'code'    => (int) wp_remote_retrieve_response_code( $response ),
+			'headers' => $raw_headers,
+			'body'    => wp_remote_retrieve_body( $response ),
+		);
+	}
+
+	/**
+	 * Read a single header value from a raw header block (case-insensitive).
+	 *
+	 * @param string $header_block Raw response headers.
+	 * @param string $name         Header name (e.g. "Location").
+	 * @return string Header value, or ''.
+	 */
+	private static function header_value( $header_block, $name ) {
+		$lines = preg_split( '/\r\n|\n|\r/', (string) $header_block );
+		foreach ( $lines as $line ) {
+			if ( preg_match( '/^' . preg_quote( $name, '/' ) . '\s*:\s*(.*)$/i', trim( $line ), $m ) ) {
+				return trim( $m[1] );
+			}
+		}
+		return '';
 	}
 
 	/**

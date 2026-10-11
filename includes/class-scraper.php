@@ -1118,7 +1118,7 @@ class SWI_Scraper {
 		$base     = $parts['scheme'] . '://' . $parts['host'] . ( isset( $parts['path'] ) ? $parts['path'] : '' );
 		$json_url = rtrim( $base, '/' ) . '.json';
 
-		$body = SWI_HTTP::get( $json_url, 20 );
+		$body = SWI_HTTP::get_with_retry( $json_url );
 		if ( is_wp_error( $body ) ) {
 			return;
 		}
@@ -1197,6 +1197,41 @@ class SWI_Scraper {
 		if ( '' === $data['sku'] && ! empty( $normalized[0]['sku'] ) ) {
 			$data['sku'] = $normalized[0]['sku'];
 		}
+
+		// The .json endpoint carries the complete, ordered product image
+		// gallery — prefer it over the single og:image / JSON-LD image.
+		if ( ! empty( $product['images'] ) && is_array( $product['images'] ) ) {
+			$imgs = array();
+			foreach ( $product['images'] as $img ) {
+				if ( ! empty( $img['src'] ) ) {
+					$imgs[] = (string) $img['src'];
+				}
+			}
+			if ( ! empty( $imgs ) ) {
+				$data['images'] = $imgs;
+			}
+		}
+
+		// Variant images: the public .json endpoint may expose them under
+		// image_id + images (when a variant has its own gallery). Prefer the
+		// explicit featured_image.src when present.
+		foreach ( $normalized as $i => $v ) {
+			if ( '' !== $v['image'] ) {
+				continue;
+			}
+			$raw_var = isset( $raw[ $i ] ) && is_array( $raw[ $i ] ) ? $raw[ $i ] : array();
+			if ( ! empty( $raw_var['featured_image']['src'] ) ) {
+				$normalized[ $i ]['image'] = (string) $raw_var['featured_image']['src'];
+			} elseif ( ! empty( $raw_var['image_id'] ) && ! empty( $product['images'] ) && is_array( $product['images'] ) ) {
+				foreach ( $product['images'] as $img ) {
+					if ( isset( $img['id'] ) && (int) $img['id'] === (int) $raw_var['image_id'] ) {
+						$normalized[ $i ]['image'] = (string) $img['src'];
+						break;
+					}
+				}
+			}
+		}
+		$data['variants'] = $normalized;
 	}
 
 	/**
