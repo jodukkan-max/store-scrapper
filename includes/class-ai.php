@@ -19,8 +19,11 @@ class SWI_AI {
 	/**
 	 * Default endpoint + token. These can be overridden in plugin options
 	 * (swi_options) if the endpoint or token ever rotates.
+	 *
+	 * The endpoint is a Gemini proxy (with reasoning/"thinking" enabled) that
+	 * runs on a Dukkan-controlled server; the Gemini key stays server-side.
 	 */
-	const DEFAULT_ENDPOINT = 'https://portal.dukkan.pro/api/ai/analyze-product';
+	const DEFAULT_ENDPOINT = 'https://a1jordan.com/dukkan-ai/analyze.php';
 	const DEFAULT_TOKEN    = 'd98b0f6ecde49ab8c7ac2b5371aabbe19887fe4371616038';
 
 	/**
@@ -63,8 +66,36 @@ class SWI_AI {
 			$payload['html_variable'] = $html_variable;
 		}
 
+		return self::request( $payload );
+	}
+
+	/**
+	 * Analyze a single (unlabeled) product page and return a scraping profile.
+	 *
+	 * Used by the auto-detect fallback: when platform detection fails, one
+	 * product page is fetched and the AI figures out how to scrape the site.
+	 *
+	 * @param string $html Product page HTML.
+	 * @return array|WP_Error Array with 'profile' on success.
+	 */
+	public static function analyze_page( $html ) {
+		$html = (string) $html;
+		if ( '' === trim( $html ) ) {
+			return new WP_Error( 'swi_ai_empty', __( 'No product HTML to analyze.', 'swi' ) );
+		}
+
+		return self::request( array( 'html' => $html ) );
+	}
+
+	/**
+	 * POST a payload to the AI endpoint and return the profile.
+	 *
+	 * @param array $payload Request body fields.
+	 * @return array|WP_Error
+	 */
+	private static function request( $payload ) {
 		$args = array(
-			'timeout'     => 120,
+			'timeout'     => 180,
 			'redirection' => 5,
 			'sslverify'   => (bool) (int) SWI_Plugin::get_option( 'sslverify', 1 ),
 			'headers'     => array(

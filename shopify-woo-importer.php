@@ -3,7 +3,7 @@
  * Plugin Name:       Shopify/WooCommerce Scraper Importer
  * Plugin URI:        https://github.com/jodukkan-max/store-scrapper
  * Description:       Scrapes a remote Shopify or WooCommerce store by reading its HTML, lets you select which products to import, and imports them into your WooCommerce store with images downloaded into the media library. Discovered products are kept in memory only (never saved to the database).
- * Version:           1.6.5
+ * Version:           1.6.6
  * Author:            Dukkan
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'SWI_VERSION', '1.6.5' );
+define( 'SWI_VERSION', '1.6.6' );
 define( 'SWI_FILE', __FILE__ );
 define( 'SWI_DIR', plugin_dir_path( __FILE__ ) );
 define( 'SWI_URL', plugin_dir_url( __FILE__ ) );

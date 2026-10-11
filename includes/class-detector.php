@@ -88,14 +88,64 @@ class SWI_Detector {
 			}
 		}
 
+		// Fallback 3: AI. When no marker matched, let the AI analyze a product
+		// page and build a scraping profile on the fly (auto-train).
 		if ( '' === $platform ) {
-			return new WP_Error( 'swi_unknown_platform', __( 'Could not detect the store platform. It may not be a Shopify or WooCommerce site.', 'swi' ) );
+			return self::detect_with_ai( $base );
 		}
 
 		return array(
 			'platform' => $platform,
 			'base_url' => $base,
 			'signals'  => $signals,
+		);
+	}
+
+	/**
+	 * AI fallback: find a product page, ask the AI to build a scraping profile,
+	 * save it, and report the site as "generic".
+	 *
+	 * @param string $base Normalized base URL.
+	 * @return array|WP_Error
+	 */
+	private static function detect_with_ai( $base ) {
+		// 1. Discover product URLs via the generic sitemap path.
+		$urls = SWI_Crawler::discover( $base, 'generic' );
+		if ( is_wp_error( $urls ) || empty( $urls ) ) {
+			return new WP_Error( 'swi_unknown_platform', __( 'Could not detect the store platform and no products were found for AI analysis.', 'swi' ) );
+		}
+
+		// 2. Fetch a product page (try a few URLs in case one 404s).
+		$html = null;
+		foreach ( array_slice( $urls, 0, 3 ) as $product_url ) {
+			$fetched = SWI_HTTP::get_with_retry( $product_url );
+			if ( ! is_wp_error( $fetched ) && '' !== trim( $fetched ) ) {
+				$html = $fetched;
+				break;
+			}
+		}
+		if ( null === $html ) {
+			return new WP_Error( 'swi_unknown_platform', __( 'Could not detect the store platform (and no product page could be fetched for AI analysis).', 'swi' ) );
+		}
+
+		// 3. Ask the AI to build a profile.
+		$profile = SWI_AI::analyze_page( $html );
+		if ( is_wp_error( $profile ) ) {
+			return $profile;
+		}
+
+		$valid = SWI_Profile::validate( $profile );
+		if ( is_wp_error( $valid ) ) {
+			return $valid;
+		}
+
+		// 4. Save it for this domain and proceed as "generic".
+		SWI_Profile::save( $base, $valid );
+
+		return array(
+			'platform' => 'generic',
+			'base_url' => $base,
+			'signals'  => array( 'ai' ),
 		);
 	}
 }
