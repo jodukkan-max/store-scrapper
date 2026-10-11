@@ -24,6 +24,16 @@ class SWI_Detector {
 			return $base;
 		}
 
+		// A saved scraping profile takes precedence: a trained site is scraped
+		// with its profile ("generic"), regardless of any platform markers.
+		if ( null !== SWI_Profile::get( $base ) ) {
+			return array(
+				'platform' => 'generic',
+				'base_url' => $base,
+				'signals'  => array( 'profile' ),
+			);
+		}
+
 		$html = SWI_HTTP::get_with_retry( $base );
 		if ( is_wp_error( $html ) ) {
 			return $html;

@@ -20,6 +20,21 @@ class SWI_Scraper {
 	 * @return array|WP_Error
 	 */
 	public static function preview( $url ) {
+		// A saved profile for this site overrides the generic meta preview.
+		$profile = SWI_Profile::get( $url );
+		if ( null !== $profile ) {
+			$data = SWI_Generic_Scraper::scrape( $url, $profile );
+			if ( is_wp_error( $data ) ) {
+				return $data;
+			}
+			return array(
+				'title'    => isset( $data['title'] ) ? $data['title'] : '',
+				'image'    => isset( $data['images'][0] ) ? $data['images'][0] : '',
+				'price'    => isset( $data['price'] ) ? $data['price'] : '',
+				'currency' => isset( $data['currency'] ) ? $data['currency'] : '',
+			);
+		}
+
 		// Previews only need a lightweight title/price/thumbnail. Use a single
 		// fast request (no retry loop, shorter timeout) so a large catalog can
 		// be previewed quickly without long stalls on slow/404 pages.
@@ -59,6 +74,13 @@ class SWI_Scraper {
 	 * @return array|WP_Error
 	 */
 	public static function scrape( $url, $platform ) {
+		// A saved profile routes this product through the generic engine,
+		// regardless of the platform argument.
+		$profile = SWI_Profile::get( $url );
+		if ( null !== $profile ) {
+			return SWI_Generic_Scraper::scrape( $url, $profile );
+		}
+
 		$html = SWI_HTTP::get_with_retry( $url );
 		if ( is_wp_error( $html ) ) {
 			return $html;

@@ -348,6 +348,140 @@
 		setStatus('#swi-discover-status', 'Products cleared.');
 	});
 
+	// --- Train UI -------------------------------------------------------
+	var $trainAnalyze = $('#swi-train-analyze');
+	var $trainSave = $('#swi-train-save');
+
+	// Read a sample's HTML source: pasted text > file > URL (server handles it).
+	function trainPayload() {
+		var fd = new FormData();
+		fd.append('action', 'swi_train_analyze');
+		fd.append('nonce', swi.nonce);
+
+		var simpleUrl = $('#swi-train-simple-url').val().trim();
+		var variableUrl = $('#swi-train-variable-url').val().trim();
+		var domain = $('#swi-train-domain').val().trim();
+
+		if (simpleUrl) fd.append('simple_url', simpleUrl);
+		if (variableUrl) fd.append('variable_url', variableUrl);
+		if (domain) fd.append('domain', domain);
+
+		// Pasted HTML takes precedence over URL (mirrors server precedence).
+		var simpleHtml = $('#swi-train-simple-html').val();
+		var variableHtml = $('#swi-train-variable-html').val();
+		if (simpleHtml && simpleHtml.trim()) fd.append('simple_html', simpleHtml);
+		if (variableHtml && variableHtml.trim()) fd.append('variable_html', variableHtml);
+
+		// Uploaded files.
+		var simpleFile = document.getElementById('swi-train-simple-file').files[0];
+		var variableFile = document.getElementById('swi-train-variable-file').files[0];
+		if (simpleFile) fd.append('simple_file', simpleFile);
+		if (variableFile) fd.append('variable_file', variableFile);
+
+		return fd;
+	}
+
+	function renderPreview(p) {
+		if (!p) return '<p class="description">' + esc('No preview available.') + '</p>';
+
+		var rows = '';
+		function row(label, val) {
+			if (val === '' || val === null || val === undefined) return '';
+			var display = Array.isArray(val) ? val.join(', ') : String(val);
+			if (display.length > 120) display = display.substring(0, 120) + '…';
+			return '<tr><th>' + esc(label) + '</th><td>' + esc(display) + '</td></tr>';
+		}
+
+		rows += row('Type', p.type);
+		rows += row('Title', p.title);
+		rows += row('Short description', p.short_description);
+		rows += row('Description', p.description);
+		rows += row('Price', p.price + (p.currency ? ' ' + p.currency : ''));
+		rows += row('Sale price', p.sale_price);
+		rows += row('SKU', p.sku);
+		rows += row('Images', p.images_count);
+		rows += row('Categories', p.categories);
+
+		if (p.variants_count) {
+			rows += '<tr><th>Variants</th><td>' + esc(p.variants_count) + '</td></tr>';
+			$.each(p.variants, function (i, v) {
+				var attrs = $.map(v.attributes, function (val, key) { return key + '=' + val; }).join(', ');
+				rows += '<tr><th style="padding-left:16px;">↳ variant ' + (i + 1) + '</th><td>' +
+					esc((attrs ? attrs + ' · ' : '') + (v.price ? v.price : '') + (v.sku ? ' · ' + v.sku : '')) + '</td></tr>';
+			});
+		}
+
+		return '<table class="widefat striped swi-preview-table"><tbody>' + rows + '</tbody></table>';
+	}
+
+	$trainAnalyze.on('click', function () {
+		var btn = $(this);
+		btn.prop('disabled', true);
+		setStatus('#swi-train-status', 'Analyzing… (this can take up to a minute)');
+
+		$.ajax({
+			url: swi.ajaxUrl,
+			method: 'POST',
+			data: trainPayload(),
+			processData: false,
+			contentType: false,
+			dataType: 'json'
+		}).done(function (res) {
+			if (res.success) {
+				setStatus('#swi-train-status', 'Analysis complete — review below.');
+				if (res.data.domain) {
+					$('#swi-train-domain').val(res.data.domain);
+				}
+				$('#swi-train-profile').val(JSON.stringify(res.data.profile, null, 2));
+				$('#swi-train-preview').html(renderPreview(res.data.preview));
+				$('#swi-train-result').show();
+				$('html, body').animate({ scrollTop: $('#swi-train-result').offset().top }, 300);
+			} else {
+				setStatus('#swi-train-status', res.data.message || 'Analysis failed.', true);
+			}
+		}).fail(function () {
+			setStatus('#swi-train-status', 'Analysis request failed.', true);
+		}).always(function () {
+			btn.prop('disabled', false);
+		});
+	});
+
+	$trainSave.on('click', function () {
+		var btn = $(this);
+		var domain = $('#swi-train-domain').val().trim();
+		var profileText = $('#swi-train-profile').val();
+
+		if (!domain) {
+			setStatus('#swi-train-save-status', 'Enter a site domain first.', true);
+			return;
+		}
+
+		try {
+			JSON.parse(profileText);
+		} catch (e) {
+			setStatus('#swi-train-save-status', 'The profile is not valid JSON.', true);
+			return;
+		}
+
+		btn.prop('disabled', true);
+		setStatus('#swi-train-save-status', 'Saving…');
+
+		ajax('swi_train_save', { domain: domain, profile: profileText })
+			.done(function (res) {
+				if (res.success) {
+					setStatus('#swi-train-save-status', 'Profile saved for ' + res.data.domain + '. You can now scrape this site from the Products tab.');
+				} else {
+					setStatus('#swi-train-save-status', res.data.message || 'Save failed.', true);
+				}
+			})
+			.fail(function () {
+				setStatus('#swi-train-save-status', 'Save request failed.', true);
+			})
+			.always(function () {
+				btn.prop('disabled', false);
+			});
+	});
+
 	// --- Debug log viewer ----------------------------------------------
 	var $debugLog = $('#swi-debug-log');
 

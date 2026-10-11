@@ -58,6 +58,8 @@ class SWI_Admin {
 			'swi_import_one',
 			'swi_debug_log',
 			'swi_clear_log',
+			'swi_train_analyze',
+			'swi_train_save',
 		);
 
 		foreach ( $ajax_actions as $action ) {
@@ -115,12 +117,13 @@ class SWI_Admin {
 		$platform = SWI_Plugin::get_option( 'platform' );
 
 		$tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'products';
-		if ( ! in_array( $tab, array( 'settings', 'products' ), true ) ) {
+		if ( ! in_array( $tab, array( 'settings', 'products', 'train' ), true ) ) {
 			$tab = 'products';
 		}
 
 		$settings_url = admin_url( 'admin.php?page=swi-importer&tab=settings' );
 		$products_url = admin_url( 'admin.php?page=swi-importer&tab=products' );
+		$train_url    = admin_url( 'admin.php?page=swi-importer&tab=train' );
 
 		?>
 		<div class="wrap swi-wrap">
@@ -135,11 +138,14 @@ class SWI_Admin {
 					<?php esc_html_e( 'Products', 'swi' ); ?>
 				</a>
 				<a href="<?php echo esc_url( $settings_url ); ?>" class="nav-tab <?php echo 'settings' === $tab ? 'nav-tab-active' : ''; ?>"><?php esc_html_e( 'Settings', 'swi' ); ?></a>
+				<a href="<?php echo esc_url( $train_url ); ?>" class="nav-tab <?php echo 'train' === $tab ? 'nav-tab-active' : ''; ?>"><?php esc_html_e( 'Train', 'swi' ); ?></a>
 			</nav>
 
 			<?php if ( 'settings' === $tab ) : ?>
 				<?php $this->render_settings_card(); ?>
 				<?php $this->render_debug_card(); ?>
+			<?php elseif ( 'train' === $tab ) : ?>
+				<?php $this->render_train_card(); ?>
 			<?php else : ?>
 				<?php $this->render_products_card( $url, $platform ); ?>
 			<?php endif; ?>
@@ -264,6 +270,58 @@ class SWI_Admin {
 			</table>
 			<p class="submit">
 				<span id="swi-discover-status" class="swi-status"></span>
+			</p>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Render the "Train" card: teach the scraper a new site from sample HTML.
+	 */
+	private function render_train_card() {
+		?>
+		<div class="swi-card">
+			<h2><?php esc_html_e( 'Train on a new site', 'swi' ); ?></h2>
+			<p class="description"><?php esc_html_e( 'Paste the URL (or upload a saved .html file) of one simple and one variable product from the site you want to scrape. The AI analyzes the HTML and produces a scraping profile, which you review and save. After that, every product on the site can be scraped via its sitemap.', 'swi' ); ?></p>
+
+			<div class="swi-train-grid">
+				<div class="swi-train-col">
+					<h3><?php esc_html_e( '1. Simple product sample', 'swi' ); ?></h3>
+					<label class="swi-field-label" for="swi-train-simple-url"><?php esc_html_e( 'Product URL', 'swi' ); ?></label>
+					<input type="text" id="swi-train-simple-url" class="regular-text" placeholder="https://site.com/products/tee" />
+					<p class="description" style="margin:4px 0 8px;"><?php esc_html_e( '…or upload a saved .html file:', 'swi' ); ?></p>
+					<input type="file" id="swi-train-simple-file" accept=".html,.htm,text/html" />
+					<textarea id="swi-train-simple-html" class="swi-train-html" rows="6" placeholder="<?php esc_attr_e( '…or paste the page HTML here', 'swi' ); ?>"></textarea>
+				</div>
+
+				<div class="swi-train-col">
+					<h3><?php esc_html_e( '2. Variable product sample (optional)', 'swi' ); ?></h3>
+					<label class="swi-field-label" for="swi-train-variable-url"><?php esc_html_e( 'Product URL', 'swi' ); ?></label>
+					<input type="text" id="swi-train-variable-url" class="regular-text" placeholder="https://site.com/products/shoes" />
+					<p class="description" style="margin:4px 0 8px;"><?php esc_html_e( '…or upload a saved .html file:', 'swi' ); ?></p>
+					<input type="file" id="swi-train-variable-file" accept=".html,.htm,text/html" />
+					<textarea id="swi-train-variable-html" class="swi-train-html" rows="6" placeholder="<?php esc_attr_e( '…or paste the page HTML here', 'swi' ); ?>"></textarea>
+				</div>
+			</div>
+
+			<label class="swi-field-label" for="swi-train-domain"><?php esc_html_e( 'Site domain (used as the profile key)', 'swi' ); ?></label>
+			<input type="text" id="swi-train-domain" class="regular-text" placeholder="example-store.com" />
+			<p class="description"><?php esc_html_e( 'Optional — auto-detected from the URL if left blank.', 'swi' ); ?></p>
+
+			<p class="submit">
+				<button type="button" class="button button-primary button-hero" id="swi-train-analyze"><?php esc_html_e( 'Analyze samples', 'swi' ); ?></button>
+				<span id="swi-train-status" class="swi-status"></span>
+			</p>
+		</div>
+
+		<div class="swi-card" id="swi-train-result" style="display:none;">
+			<h2><?php esc_html_e( '3. Review & save the profile', 'swi' ); ?></h2>
+			<div id="swi-train-preview"></div>
+			<label class="swi-field-label" for="swi-train-profile"><?php esc_html_e( 'Scraping profile (JSON — edit if needed)', 'swi' ); ?></label>
+			<textarea id="swi-train-profile" class="swi-train-profile" rows="22" spellcheck="false"></textarea>
+			<p class="submit">
+				<button type="button" class="button button-primary button-hero" id="swi-train-save"><?php esc_html_e( 'Save profile', 'swi' ); ?></button>
+				<span id="swi-train-save-status" class="swi-status"></span>
 			</p>
 		</div>
 		<?php
@@ -559,6 +617,176 @@ class SWI_Admin {
 				)
 			);
 		}
+	}
+
+	/**
+	 * AJAX: analyze sample product HTML via the AI endpoint.
+	 *
+	 * Accepts URL(s) and/or uploaded .html file(s) and/or pasted HTML for the
+	 * simple + variable samples, fetches any URLs server-side, sends the HTML
+	 * to the AI endpoint, and returns the resulting profile plus a preview of
+	 * the fields it would extract.
+	 */
+	public function ajax_swi_train_analyze() {
+		$this->verify_ajax();
+
+		$html_simple   = $this->train_sample_html( 'simple' );
+		$html_variable = $this->train_sample_html( 'variable' );
+
+		if ( is_wp_error( $html_simple ) ) {
+			wp_send_json_error( array( 'message' => $html_simple->get_error_message() ) );
+		}
+		if ( is_wp_error( $html_variable ) ) {
+			wp_send_json_error( array( 'message' => $html_variable->get_error_message() ) );
+		}
+
+		if ( '' === $html_simple && '' === $html_variable ) {
+			wp_send_json_error( array( 'message' => __( 'Provide a URL, an uploaded .html file, or pasted HTML for at least one sample product.', 'swi' ) ) );
+		}
+
+		$profile = SWI_AI::analyze( $html_simple, $html_variable );
+		if ( is_wp_error( $profile ) ) {
+			wp_send_json_error( array( 'message' => $profile->get_error_message() ) );
+		}
+
+		// Validate with the local profile model (drops unsupported rules).
+		$valid = SWI_Profile::validate( $profile );
+		if ( is_wp_error( $valid ) ) {
+			wp_send_json_error( array( 'message' => $valid->get_error_message() ) );
+		}
+
+		// Domain: explicit input wins, else derived from a sample URL.
+		$domain = isset( $_POST['domain'] ) ? sanitize_text_field( wp_unslash( $_POST['domain'] ) ) : '';
+		$domain = SWI_Profile::normalize_domain( $domain );
+		if ( '' === $domain ) {
+			$base_url = isset( $_POST['simple_url'] ) && '' !== trim( (string) $_POST['simple_url'] )
+				? (string) $_POST['simple_url']
+				: ( isset( $_POST['variable_url'] ) ? (string) $_POST['variable_url'] : '' );
+			$domain = SWI_Profile::normalize_domain( $base_url );
+		}
+
+		// Preview: apply the profile to whichever sample HTML we have.
+		$preview = array();
+		$sample  = ( '' !== $html_variable ) ? $html_variable : $html_simple;
+		$base    = isset( $_POST['variable_url'] ) && '' !== trim( (string) $_POST['variable_url'] ) ? (string) $_POST['variable_url'] : ( isset( $_POST['simple_url'] ) ? (string) $_POST['simple_url'] : '' );
+
+		if ( '' !== $sample && '' !== $base ) {
+			$data = SWI_Generic_Scraper::scrape_html( $sample, $base, $valid );
+			if ( ! is_wp_error( $data ) ) {
+				$preview = $this->preview_summary( $data );
+			}
+		}
+
+		wp_send_json_success(
+			array(
+				'domain'  => $domain,
+				'profile' => $valid,
+				'preview' => $preview,
+			)
+		);
+	}
+
+	/**
+	 * AJAX: save a scraping profile for a domain.
+	 */
+	public function ajax_swi_train_save() {
+		$this->verify_ajax();
+
+		$domain  = isset( $_POST['domain'] ) ? sanitize_text_field( wp_unslash( $_POST['domain'] ) ) : '';
+		$profile = isset( $_POST['profile'] ) ? wp_unslash( $_POST['profile'] ) : ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized — JSON, validated below.
+
+		$decoded = json_decode( $profile, true );
+		if ( ! is_array( $decoded ) || JSON_ERROR_NONE !== json_last_error() ) {
+			wp_send_json_error( array( 'message' => __( 'The profile is not valid JSON.', 'swi' ) ) );
+		}
+
+		$saved = SWI_Profile::save( $domain, $decoded );
+		if ( is_wp_error( $saved ) ) {
+			wp_send_json_error( array( 'message' => $saved->get_error_message() ) );
+		}
+
+		wp_send_json_success(
+			array(
+				'message' => __( 'Profile saved.', 'swi' ),
+				'domain'  => $saved['domain'],
+			)
+		);
+	}
+
+	/**
+	 * Resolve a sample's HTML from URL upload / file upload / pasted text.
+	 *
+	 * Precedence: pasted HTML text > uploaded file > URL fetch.
+	 *
+	 * @param string $which 'simple' | 'variable'.
+	 * @return string|WP_Error
+	 */
+	private function train_sample_html( $which ) {
+		// 1. Pasted HTML.
+		$html_key = $which . '_html';
+		if ( isset( $_POST[ $html_key ] ) && '' !== trim( (string) $_POST[ $html_key ] ) ) {
+			return wp_unslash( $_POST[ $html_key ] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized — raw HTML, parsed server-side.
+		}
+
+		// 2. Uploaded file.
+		$file_key = $which . '_file';
+		if ( isset( $_FILES[ $file_key ] ) && is_array( $_FILES[ $file_key ] ) && UPLOAD_ERR_OK === (int) $_FILES[ $file_key ]['error'] ) {
+			$tmp = $_FILES[ $file_key ]['tmp_name'];
+			if ( is_uploaded_file( $tmp ) ) {
+				$contents = (string) file_get_contents( $tmp );
+				if ( '' !== trim( $contents ) ) {
+					return $contents;
+				}
+			}
+		}
+
+		// 3. URL fetch.
+		$url_key = $which . '_url';
+		if ( isset( $_POST[ $url_key ] ) && '' !== trim( (string) $_POST[ $url_key ] ) ) {
+			$html = SWI_HTTP::get_with_retry( sanitize_text_field( wp_unslash( $_POST[ $url_key ] ) ) );
+			if ( is_wp_error( $html ) ) {
+				return $html;
+			}
+			return $html;
+		}
+
+		return '';
+	}
+
+	/**
+	 * Build a compact preview summary of extracted product data.
+	 *
+	 * @param array $data Normalized product data.
+	 * @return array
+	 */
+	private function preview_summary( $data ) {
+		$summary = array(
+			'type'             => isset( $data['type'] ) ? (string) $data['type'] : 'simple',
+			'title'            => isset( $data['title'] ) ? (string) $data['title'] : '',
+			'short_description' => isset( $data['short_description'] ) ? (string) $data['short_description'] : '',
+			'description'      => isset( $data['description'] ) ? (string) $data['description'] : '',
+			'price'            => isset( $data['price'] ) ? (string) $data['price'] : '',
+			'sale_price'       => isset( $data['sale_price'] ) ? (string) $data['sale_price'] : '',
+			'currency'         => isset( $data['currency'] ) ? (string) $data['currency'] : '',
+			'sku'              => isset( $data['sku'] ) ? (string) $data['sku'] : '',
+			'images_count'     => isset( $data['images'] ) ? count( (array) $data['images'] ) : 0,
+			'categories'       => isset( $data['categories'] ) ? array_values( (array) $data['categories'] ) : array(),
+			'variants'         => array(),
+		);
+
+		if ( ! empty( $data['variants'] ) && is_array( $data['variants'] ) ) {
+			$summary['variants_count'] = count( $data['variants'] );
+			foreach ( array_slice( $data['variants'], 0, 3 ) as $v ) {
+				$summary['variants'][] = array(
+					'attributes' => isset( $v['attributes'] ) ? $v['attributes'] : array(),
+					'price'      => isset( $v['price'] ) ? $v['price'] : '',
+					'sku'        => isset( $v['sku'] ) ? $v['sku'] : '',
+					'image'      => isset( $v['image'] ) ? $v['image'] : '',
+				);
+			}
+		}
+
+		return $summary;
 	}
 
 	/**

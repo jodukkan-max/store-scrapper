@@ -51,6 +51,11 @@
 	color: #fff;
 }
 
+.swi-badge--generic {
+	background: #d67700;
+	color: #fff;
+}
+
 .swi-status {
 	display: inline-block;
 	margin-left: 10px;
@@ -141,4 +146,46 @@
 
 .swi-log__error {
 	color: #ff6b6b;
+}
+
+/* Train tab */
+.swi-train-grid {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 24px;
+	margin: 16px 0;
+}
+
+@media (max-width: 782px) {
+	.swi-train-grid {
+		grid-template-columns: 1fr;
+	}
+}
+
+.swi-train-col h3 {
+	margin: 0 0 8px;
+}
+
+.swi-field-label {
+	display: block;
+	font-weight: 600;
+	margin: 8px 0 4px;
+}
+
+.swi-train-html {
+	width: 100%;
+	margin-top: 8px;
+	font-family: monospace;
+	font-size: 12px;
+}
+
+.swi-train-profile {
+	width: 100%;
+	font-family: monospace;
+	font-size: 12px;
+}
+
+.swi-preview-table th {
+	width: 160px;
+	vertical-align: top;
 }

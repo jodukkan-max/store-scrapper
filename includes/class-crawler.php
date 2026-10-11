@@ -56,8 +56,12 @@ class SWI_Crawler {
 	 * couple of paginated requests (instead of scraping each product page), so
 	 * the selection screen populates near-instantly.
 	 *
+	 * Generic (trained) sites have no public JSON endpoint, so this returns a
+	 * WP_Error to signal the caller to fall back to sitemap discovery + per-page
+	 * previews.
+	 *
 	 * @param string $base_url Target store URL.
-	 * @param string $platform shopify|woocommerce.
+	 * @param string $platform shopify|woocommerce|generic.
 	 * @return array|WP_Error Array of product arrays:
 	 *                         array( 'source_url', 'title', 'thumbnail', 'price', 'currency' ).
 	 */
@@ -71,7 +75,12 @@ class SWI_Crawler {
 			return self::bulk_shopify( $base );
 		}
 
-		return self::bulk_woocommerce( $base );
+		if ( 'woocommerce' === $platform ) {
+			return self::bulk_woocommerce( $base );
+		}
+
+		// Generic: no bulk endpoint — signal the caller to use sitemaps.
+		return new WP_Error( 'swi_no_bulk', __( 'This site uses a saved profile; discovery falls back to the sitemap.', 'swi' ) );
 	}
 
 	/**
@@ -249,11 +258,14 @@ class SWI_Crawler {
 			);
 		}
 
+		// WooCommerce + generic share the standard sitemap locations; the
+		// sitemap index is recursed automatically when present.
 		return array(
-			$base . '/wp-sitemap.xml',
 			$base . '/sitemap.xml',
 			$base . '/sitemap_index.xml',
+			$base . '/wp-sitemap.xml',
 			$base . '/product-sitemap.xml',
+			$base . '/sitemap_products_1.xml',
 		);
 	}
 
@@ -318,7 +330,13 @@ class SWI_Crawler {
 		$visited = array();
 		$queue   = array( $base );
 
-		$pattern = ( 'shopify' === $platform ) ? '#/products/[^/]+#i' : '#/products?/[^/]+#i';
+		if ( 'shopify' === $platform ) {
+			$product_pattern = '#/products/[^/]+#i';
+		} elseif ( 'woocommerce' === $platform ) {
+			$product_pattern = '#/products?/[^/]+#i';
+		} else {
+			$product_pattern = ''; // generic: no reliable URL shape — rely on sitemap.
+		}
 
 		while ( ! empty( $queue ) && count( $visited ) < $max_pages ) {
 			$url = array_shift( $queue );
@@ -348,11 +366,12 @@ class SWI_Crawler {
 
 				$path = (string) wp_parse_url( $abs, PHP_URL_PATH );
 
-				if ( preg_match( $pattern, $path ) ) {
+				if ( '' !== $product_pattern && preg_match( $product_pattern, $path ) ) {
 					$found[] = $abs;
 				} elseif (
 					preg_match( '#/collections/#i', $abs ) ||
 					preg_match( '#/product-category/#i', $abs ) ||
+					preg_match( '#/catalogue/category/#i', $abs ) ||
 					preg_match( '#/page/\d+#i', $abs )
 				) {
 					if ( count( $visited ) + count( $queue ) < $max_pages + 10 ) {
@@ -395,12 +414,52 @@ class SWI_Crawler {
 				if ( preg_match( '#/products/[^/]+#i', $path ) ) {
 					$out[] = $u;
 				}
-			} elseif ( preg_match( '#/products?/[^/]+#i', $path ) && ! preg_match( '#/product-category/|/product-tag/|/products/page/#i', $path ) ) {
-				$out[] = $u;
+			} elseif ( 'woocommerce' === $platform ) {
+				if ( preg_match( '#/products?/[^/]+#i', $path ) && ! preg_match( '#/product-category/|/product-tag/|/products/page/#i', $path ) ) {
+					$out[] = $u;
+				}
+			} else {
+				// Generic: keep sitemap URLs that are not obviously non-product
+				// pages. Product pages outnumber utility pages, and the profile
+				// (applied at import time) is what actually extracts the data.
+				if ( ! self::is_non_product_path( $path ) ) {
+					$out[] = $u;
+				}
 			}
 		}
 
 		return array_values( array_unique( $out ) );
+	}
+
+	/**
+	 * Whether a URL path looks like a non-product page (for generic sites).
+	 *
+	 * @param string $path URL path.
+	 * @return bool
+	 */
+	private static function is_non_product_path( $path ) {
+		$path = strtolower( (string) $path );
+
+		// Homepage and bare language roots ("/", "/el/", "/en/") are never products.
+		if ( '' === $path || '/' === $path || 1 === preg_match( '#^/[a-z]{2,3}/?$#', $path ) ) {
+			return true;
+		}
+
+		$exclude = array(
+			'/cart', '/checkout', '/account', '/login', '/register', '/wishlist',
+			'/category/', '/tag/', '/collections/', '/catalogue/category/',
+			'/blog/', '/news/', '/search', '/about', '/contact', '/policy',
+			'/privacy', '/terms', '/shipping', '/returns', '/faq',
+			'/page/', '/product-category/', '/product-tag/',
+		);
+
+		foreach ( $exclude as $needle ) {
+			if ( false !== strpos( $path, $needle ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**

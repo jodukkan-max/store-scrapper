@@ -65,6 +65,9 @@ class SWI_Importer {
 
 		$product->set_name( self::clean_title( $data['title'] ) );
 		$product->set_description( wp_kses_post( $data['description'] ) );
+		if ( ! empty( $data['short_description'] ) ) {
+			$product->set_short_description( wp_kses_post( $data['short_description'] ) );
+		}
 		$product->set_status( self::import_status() );
 		$product->set_catalog_visibility( 'visible' );
 
@@ -112,6 +115,9 @@ class SWI_Importer {
 
 		$product->set_name( self::clean_title( $data['title'] ) );
 		$product->set_description( wp_kses_post( $data['description'] ) );
+		if ( ! empty( $data['short_description'] ) ) {
+			$product->set_short_description( wp_kses_post( $data['short_description'] ) );
+		}
 		$product->set_status( self::import_status() );
 		$product->set_catalog_visibility( 'visible' );
 
