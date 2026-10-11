@@ -365,10 +365,17 @@ class SWI_Importer {
 			return null;
 		}
 
-		$slugs = array();
+		// Collect TERM IDs (not slugs). WooCommerce's WC_Product_Attribute::get_terms()
+		// treats string options as term NAMES and re-creates terms that don't match
+		// by name (a slug like "01-light-beige" won't match the term's display name
+		// "01 LIGHT BEIGE", so it spawns a duplicate "01-light-beige-2" term). Passing
+		// integer term IDs makes get_terms() resolve them by ID — no duplicates.
+		$term_ids = array();
 		foreach ( (array) $swatch['terms'] as $slug => $term ) {
-			self::ensure_swatch_term( $tax, (array) $term );
-			$slugs[] = (string) $slug;
+			$term_id = self::ensure_swatch_term( $tax, (array) $term );
+			if ( $term_id > 0 ) {
+				$term_ids[] = (int) $term_id;
+			}
 		}
 
 		$attr_id = (int) wc_attribute_taxonomy_id_by_name( substr( $tax, 3 ) );
@@ -376,7 +383,7 @@ class SWI_Importer {
 		$attribute = new WC_Product_Attribute();
 		$attribute->set_id( $attr_id );
 		$attribute->set_name( $tax );
-		$attribute->set_options( $slugs );
+		$attribute->set_options( $term_ids );
 		$attribute->set_position( $position );
 		$attribute->set_visible( true );
 		$attribute->set_variation( true );

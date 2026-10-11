@@ -1020,7 +1020,7 @@ class SWI_Scraper {
 				'sale_price' => ( $price > 0 && $regular > $price ) ? $price : '',
 				'sku'        => isset( $v['sku'] ) ? (string) $v['sku'] : '',
 				'image'      => $image,
-				'stock'      => isset( $v['max_qty'] ) ? (int) $v['max_qty'] : null,
+				'stock'      => ( isset( $v['is_in_stock'] ) && ! $v['is_in_stock'] ) ? 0 : null,
 			);
 		}
 
