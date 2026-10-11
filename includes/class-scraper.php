@@ -118,7 +118,14 @@ class SWI_Scraper {
 		// 4. Product type (simple vs variable) + variants.
 		self::apply_type_and_variants( $doc, $html, $platform, $data );
 
-		// 4b. Rey variation swatches (color/image/button) for WooCommerce.
+		// 4b. Shopify: authoritative variant data from the public `.json`
+		// endpoint (option names + values + decimal prices). More reliable
+		// than HTML and resilient to the page being rate-limited (429).
+		if ( 'shopify' === $platform ) {
+			self::apply_shopify_json_endpoint( $url, $data );
+		}
+
+		// 4c. Rey variation swatches (color/image/button) for WooCommerce.
 		self::apply_swatches( $doc, $platform, $data );
 
 		// 5. Absolutize any relative image URLs against the product URL.
@@ -261,6 +268,10 @@ class SWI_Scraper {
 							'sku'        => isset( $offer['sku'] ) ? $offer['sku'] : '',
 							'image'      => '',
 						);
+					}
+					// Currency is shared across offers; the first one is authoritative.
+					if ( '' === $data['currency'] && isset( $offers[0]['priceCurrency'] ) ) {
+						$data['currency'] = (string) $offers[0]['priceCurrency'];
 					}
 				} elseif ( '' === $data['price'] && isset( $offers[0]['price'] ) ) {
 					$data['price']    = (string) $offers[0]['price'];
@@ -1082,6 +1093,110 @@ class SWI_Scraper {
 		}
 
 		return false;
+	}
+
+	/**
+	 * Fetch Shopify's authoritative single-product `.json` endpoint and use its
+	 * options + variants to (re)populate the normalized variant list.
+	 *
+	 * The HTML page can be rate-limited (429) and many themes omit the variant
+	 * option names from the markup, while `products/<handle>.json` always
+	 * returns the full options (names + values) and variants (option1/2/3, sku,
+	 * decimal price, image, inventory). This fills in variant attribute names
+	 * and the parent price/currency that HTML-only extraction misses.
+	 *
+	 * @param string $url  Product URL.
+	 * @param array  $data Data (by reference).
+	 */
+	private static function apply_shopify_json_endpoint( $url, &$data ) {
+		// Build the .json URL from scheme+host+path, dropping any query string
+		// (e.g. "?variant=123" would otherwise break the .json suffix).
+		$parts = wp_parse_url( $url );
+		if ( empty( $parts['scheme'] ) || empty( $parts['host'] ) ) {
+			return;
+		}
+		$base     = $parts['scheme'] . '://' . $parts['host'] . ( isset( $parts['path'] ) ? $parts['path'] : '' );
+		$json_url = rtrim( $base, '/' ) . '.json';
+
+		$body = SWI_HTTP::get( $json_url, 20 );
+		if ( is_wp_error( $body ) ) {
+			return;
+		}
+
+		$decoded = json_decode( $body, true );
+		if ( JSON_ERROR_NONE !== json_last_error() || ! is_array( $decoded ) ) {
+			return;
+		}
+
+		$product = isset( $decoded['product'] ) && is_array( $decoded['product'] ) ? $decoded['product'] : $decoded;
+		$options = isset( $product['options'] ) && is_array( $product['options'] ) ? $product['options'] : array();
+		$raw     = isset( $product['variants'] ) && is_array( $product['variants'] ) ? $product['variants'] : array();
+
+		if ( empty( $raw ) ) {
+			return;
+		}
+
+		// Option names, in position order.
+		$option_names = array();
+		foreach ( $options as $o ) {
+			if ( ! empty( $o['name'] ) ) {
+				$option_names[] = (string) $o['name'];
+			}
+		}
+
+		$normalized = array();
+		foreach ( $raw as $v ) {
+			// Prefer option1/2/3 (authoritative); fall back to splitting the
+			// title on " / " (older themes).
+			$option_values = array();
+			for ( $i = 1; $i <= 3; $i++ ) {
+				$key = 'option' . $i;
+				if ( isset( $v[ $key ] ) && null !== $v[ $key ] && '' !== (string) $v[ $key ] ) {
+					$option_values[] = (string) $v[ $key ];
+				}
+			}
+			if ( empty( $option_values ) && isset( $v['title'] ) ) {
+				$option_values = explode( ' / ', (string) $v['title'] );
+			}
+
+			$attrs = array();
+			foreach ( $option_values as $i => $part ) {
+				$name           = isset( $option_names[ $i ] ) ? $option_names[ $i ] : 'Option ' . ( $i + 1 );
+				$attrs[ $name ] = trim( (string) $part );
+			}
+
+			// The .json endpoint returns decimal prices ("39.00"), not cents.
+			$price   = isset( $v['price'] ) && is_numeric( $v['price'] ) ? (float) $v['price'] : 0;
+			$compare = isset( $v['compare_at_price'] ) && is_numeric( $v['compare_at_price'] ) ? (float) $v['compare_at_price'] : 0;
+			$regular = ( $compare > 0 && $compare > $price ) ? $compare : $price;
+			$sale    = ( $compare > 0 && $compare > $price ) ? $price : '';
+
+			$normalized[] = array(
+				'attributes' => $attrs,
+				'price'      => $regular,
+				'sale_price' => $sale,
+				'sku'        => isset( $v['sku'] ) ? (string) $v['sku'] : '',
+				'image'      => ! empty( $v['featured_image']['src'] ) ? (string) $v['featured_image']['src'] : '',
+				'stock'      => isset( $v['inventory_quantity'] ) && null !== $v['inventory_quantity'] ? (int) $v['inventory_quantity'] : null,
+			);
+		}
+
+		if ( empty( $normalized ) ) {
+			return;
+		}
+
+		$data['variants'] = $normalized;
+		if ( count( $normalized ) > 1 ) {
+			$data['type'] = 'variable';
+		}
+
+		// Fill parent fallbacks.
+		if ( '' === $data['price'] && ! empty( $normalized[0]['price'] ) ) {
+			$data['price'] = (string) $normalized[0]['price'];
+		}
+		if ( '' === $data['sku'] && ! empty( $normalized[0]['sku'] ) ) {
+			$data['sku'] = $normalized[0]['sku'];
+		}
 	}
 
 	/**
