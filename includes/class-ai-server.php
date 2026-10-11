@@ -221,7 +221,7 @@ class SWI_AI_Server {
 			'RULES:',
 			'- Reason carefully about the HTML structure; prefer JSON-LD and <meta> tags when present (most reliable).',
 			'- Use structural selectors (classes/ids/attributes) stable across the site — never a value specific to just one product.',
-			'- For "images" use selector_all on gallery <img> elements with "attribute":"src".',
+			'- For "images": use selector_all on the PRODUCT GALLERY container (e.g. "#product-gallery img", ".fotorama img", ".woocommerce-product-gallery img", ".product__media img", ".gallery img") with "attribute":"src". Do NOT use a generic class shared by logos/icons/related products (e.g. "img-fluid", ".img", "img").',
 			'- For "categories" use jsonld_all path "itemListElement.name" when a BreadcrumbList exists, else selector_all on breadcrumb <a> links.',
 			'- CSS must be standard (tag, .class, #id, [attr], [attr="v"], descendant/child, comma). No :contains()/:has()/:not().',
 			'',

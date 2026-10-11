@@ -88,6 +88,14 @@ class SWI_Generic_Scraper {
 			self::apply_variable( $doc, $xpath, $html, $profile['variable'], $data );
 		}
 
+		// Image fallback: if the profile's images rule yielded nothing (or the
+		// AI guessed a wrong selector), try known gallery containers so product
+		// images are still captured deterministically (PrestaShop/fotorama,
+		// Shopify, WooCommerce, generic swiper/owl carousels, etc.).
+		if ( empty( $data['images'] ) ) {
+			$data['images'] = self::fallback_images( $xpath );
+		}
+
 		// Absolutize image URLs against the product URL.
 		$data['images'] = self::absolutize_images( $data['images'], $url );
 		foreach ( $data['variants'] as $i => $variant ) {
@@ -1080,6 +1088,62 @@ class SWI_Generic_Scraper {
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * Fallback image extraction: try well-known product-gallery containers.
+	 *
+	 * Used when the profile's images rule yielded nothing, so product images
+	 * are still captured deterministically. Runs the candidate selectors in
+	 * priority order and returns the first non-empty result set.
+	 *
+	 * @param DOMXPath $xpath XPath instance.
+	 * @return array Image URLs.
+	 */
+	private static function fallback_images( $xpath ) {
+		$selectors = array(
+			// PrestaShop / fotorama.
+			'#product-gallery img',
+			'.fotorama img',
+			// WooCommerce.
+			'.woocommerce-product-gallery img',
+			'.woocommerce-product-gallery__image img',
+			'.product .images img',
+			// Shopify (Dawn/theme gallery).
+			'.product__media img',
+			'.product-gallery img',
+			'[data-product-gallery] img',
+			// Generic carousels.
+			'.gallery img',
+			'.product-images img',
+			'.swiper-container img',
+			'.owl-carousel img',
+		);
+
+		foreach ( $selectors as $selector ) {
+			$xpath_expr = self::css_to_xpath( $selector );
+			$nodes      = $xpath->query( $xpath_expr );
+			if ( ! $nodes || 0 === $nodes->length ) {
+				continue;
+			}
+
+			$out = array();
+			foreach ( $nodes as $node ) {
+				$src = trim( $node->getAttribute( 'src' ) );
+				if ( '' === $src ) {
+					$src = trim( $node->getAttribute( 'data-src' ) );
+				}
+				if ( '' !== $src ) {
+					$out[] = $src;
+				}
+			}
+
+			if ( ! empty( $out ) ) {
+				return array_values( array_unique( $out ) );
+			}
+		}
+
+		return array();
 	}
 
 	/**
