@@ -20,10 +20,11 @@ class SWI_AI {
 	 * Default endpoint + token. These can be overridden in plugin options
 	 * (swi_options) if the endpoint or token ever rotates.
 	 *
-	 * The endpoint is a Gemini proxy (with reasoning/"thinking" enabled) that
-	 * runs on a Dukkan-controlled server; the Gemini key stays server-side.
+	 * The endpoint is a Gemini proxy (with reasoning/"thinking" enabled). It is
+	 * served by this same plugin (SWI_AI_Server) on the designated server
+	 * instance; the Gemini key lives server-side on that instance only.
 	 */
-	const DEFAULT_ENDPOINT = 'https://a1jordan.com/dukkan-ai/analyze.php';
+	const DEFAULT_ENDPOINT = 'https://a1jordan.com/wp-json/swi/v1/analyze';
 	const DEFAULT_TOKEN    = 'd98b0f6ecde49ab8c7ac2b5371aabbe19887fe4371616038';
 
 	/**

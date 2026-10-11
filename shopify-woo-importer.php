@@ -3,7 +3,7 @@
  * Plugin Name:       Shopify/WooCommerce Scraper Importer
  * Plugin URI:        https://github.com/jodukkan-max/store-scrapper
  * Description:       Scrapes a remote Shopify or WooCommerce store by reading its HTML, lets you select which products to import, and imports them into your WooCommerce store with images downloaded into the media library. Discovered products are kept in memory only (never saved to the database).
- * Version:           1.6.6
+ * Version:           1.6.7
  * Author:            Dukkan
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'SWI_VERSION', '1.6.6' );
+define( 'SWI_VERSION', '1.6.7' );
 define( 'SWI_FILE', __FILE__ );
 define( 'SWI_DIR', plugin_dir_path( __FILE__ ) );
 define( 'SWI_URL', plugin_dir_url( __FILE__ ) );
@@ -27,6 +27,7 @@ require_once SWI_DIR . 'includes/class-scraper.php';
 require_once SWI_DIR . 'includes/class-profile.php';
 require_once SWI_DIR . 'includes/class-generic-scraper.php';
 require_once SWI_DIR . 'includes/class-ai.php';
+require_once SWI_DIR . 'includes/class-ai-server.php';
 require_once SWI_DIR . 'includes/class-importer.php';
 require_once SWI_DIR . 'includes/class-debug.php';
 require_once SWI_DIR . 'includes/class-admin.php';
@@ -63,6 +64,9 @@ final class SWI_Plugin {
 
 		// Self-hosted update checks (GitHub releases).
 		new SWI_Updater( SWI_FILE, SWI_VERSION );
+
+		// AI analysis server (REST endpoint for the "thinking" proxy).
+		SWI_AI_Server::register();
 
 		if ( ! class_exists( 'WooCommerce' ) ) {
 			add_action( 'admin_notices', array( __CLASS__, 'woo_missing_notice' ) );
