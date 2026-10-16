@@ -2074,7 +2074,10 @@ class SWI_Generic_Scraper {
 		//   - color-picker-item <a href=".../p-<id>/"> carries the swatch color
 		//   - JSON-LD offer "url" .../p-<id>/ + "name" ("... shade 020N ...")
 		$pid_to_color = array();
-		$items        = $xpath->query( '//*[@data-testid="color-picker-item"]' );
+		// Match BOTH "color-picker-item" and "color-picker-item-selected" — the
+		// selected shade uses a different data-testid value and would otherwise
+		// be skipped, dropping its swatch color.
+		$items = $xpath->query( '//*[starts-with(@data-testid, "color-picker-item")]' );
 		if ( $items && $items->length ) {
 			foreach ( $items as $item ) {
 				$frag  = $doc->saveHTML( $item );
@@ -2098,17 +2101,27 @@ class SWI_Generic_Scraper {
 				if ( ! in_array( 'Product', $type, true ) || empty( $node['offers'] ) ) {
 					continue;
 				}
-				$offers = isset( $node['offers'][0] ) ? $node['offers'] : array( $node['offers'] );
+				$parent_name = isset( $node['name'] ) ? (string) $node['name'] : '';
+				$offers      = isset( $node['offers'][0] ) ? $node['offers'] : array( $node['offers'] );
 				foreach ( $offers as $offer ) {
 					if ( ! is_array( $offer ) ) {
 						continue;
 					}
 					$name = isset( $offer['name'] ) ? (string) $offer['name'] : '';
-					if ( ! preg_match( '/shade\s+([A-Za-z0-9]+)/', $name, $m ) ) {
+					if ( '' === $name ) {
 						continue;
 					}
-					$shade = $m[1];
-					$url   = isset( $offer['url'] ) ? (string) $offer['url'] : ( isset( $offer['@id'] ) ? (string) $offer['@id'] : '' );
+					// Reuse the same parser that produces the VARIANT attribute
+					// values, so the swatch term name EXACTLY matches the
+					// variation value ("Sable - Beige", "Doré - Honey"). A
+					// first-word-only regex here would yield "Sable"/"Dor" and
+					// break the term↔variation link (no swatch rendered).
+					$attr  = self::parse_offer_attribute( $parent_name, $name );
+					$shade = trim( (string) $attr['value'] );
+					if ( '' === $shade ) {
+						continue;
+					}
+					$url = isset( $offer['url'] ) ? (string) $offer['url'] : ( isset( $offer['@id'] ) ? (string) $offer['@id'] : '' );
 					if ( ! preg_match( '/p-(\d+)/', $url, $pm ) ) {
 						continue;
 					}
