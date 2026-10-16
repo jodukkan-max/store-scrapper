@@ -60,6 +60,12 @@ class SWI_Admin {
 			'swi_clear_log',
 			'swi_train_analyze',
 			'swi_train_save',
+			'swi_profiles_list',
+			'swi_profile_delete',
+			'swi_universal_scrape',
+			'swi_ai_fix',
+			'swi_ai_fix_train',
+			'swi_universal_catalog',
 		);
 
 		foreach ( $ajax_actions as $action ) {
@@ -91,8 +97,14 @@ class SWI_Admin {
 			return;
 		}
 
-		wp_enqueue_style( 'swi-admin', SWI_URL . 'assets/css/admin.css', array(), SWI_VERSION );
-		wp_enqueue_script( 'swi-admin', SWI_URL . 'assets/js/admin.js', array( 'jquery' ), SWI_VERSION, true );
+		// Use file modification times as the asset version so a hot-patched
+		// admin.js/admin.css is picked up immediately (browser cache busting)
+		// without needing a plugin version bump.
+		$css_ver = (string) @filemtime( SWI_DIR . 'assets/css/admin.css' );
+		$js_ver  = (string) @filemtime( SWI_DIR . 'assets/js/admin.js' );
+
+		wp_enqueue_style( 'swi-admin', SWI_URL . 'assets/css/admin.css', array(), $css_ver );
+		wp_enqueue_script( 'swi-admin', SWI_URL . 'assets/js/admin.js', array( 'jquery' ), $js_ver, true );
 
 		wp_localize_script(
 			'swi-admin',
@@ -117,13 +129,13 @@ class SWI_Admin {
 		$platform = SWI_Plugin::get_option( 'platform' );
 
 		$tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'products';
-		if ( ! in_array( $tab, array( 'settings', 'products', 'train' ), true ) ) {
+		if ( ! in_array( $tab, array( 'settings', 'products', 'universal' ), true ) ) {
 			$tab = 'products';
 		}
 
 		$settings_url = admin_url( 'admin.php?page=swi-importer&tab=settings' );
 		$products_url = admin_url( 'admin.php?page=swi-importer&tab=products' );
-		$train_url    = admin_url( 'admin.php?page=swi-importer&tab=train' );
+		$universal_url = admin_url( 'admin.php?page=swi-importer&tab=universal' );
 
 		?>
 		<div class="wrap swi-wrap">
@@ -138,14 +150,14 @@ class SWI_Admin {
 					<?php esc_html_e( 'Products', 'swi' ); ?>
 				</a>
 				<a href="<?php echo esc_url( $settings_url ); ?>" class="nav-tab <?php echo 'settings' === $tab ? 'nav-tab-active' : ''; ?>"><?php esc_html_e( 'Settings', 'swi' ); ?></a>
-				<a href="<?php echo esc_url( $train_url ); ?>" class="nav-tab <?php echo 'train' === $tab ? 'nav-tab-active' : ''; ?>"><?php esc_html_e( 'Train', 'swi' ); ?></a>
+				<a href="<?php echo esc_url( $universal_url ); ?>" class="nav-tab <?php echo 'universal' === $tab ? 'nav-tab-active' : ''; ?>"><?php esc_html_e( 'Universal Website', 'swi' ); ?></a>
 			</nav>
 
 			<?php if ( 'settings' === $tab ) : ?>
 				<?php $this->render_settings_card(); ?>
 				<?php $this->render_debug_card(); ?>
-			<?php elseif ( 'train' === $tab ) : ?>
-				<?php $this->render_train_card(); ?>
+			<?php elseif ( 'universal' === $tab ) : ?>
+				<?php $this->render_universal_card(); ?>
 			<?php else : ?>
 				<?php $this->render_products_card( $url, $platform ); ?>
 			<?php endif; ?>
@@ -200,6 +212,23 @@ class SWI_Admin {
 								<?php esc_html_e( 'Verify SSL certificates when fetching stores and images (recommended)', 'swi' ); ?>
 							</label>
 							<p class="description"><?php esc_html_e( 'Only disable this if a source store has an invalid certificate.', 'swi' ); ?></p>
+						</td>
+					</tr>
+					<tr>
+						<th scope="row"><label for="swi_model_provider"><?php esc_html_e( 'AI model provider', 'swi' ); ?></label></th>
+						<td>
+							<select name="swi_model_provider" id="swi_model_provider">
+								<option value="gemini" <?php selected( SWI_Plugin::get_option( 'model_provider', 'gemini' ), 'gemini' ); ?>><?php esc_html_e( 'Gemini (recommended — best quality)', 'swi' ); ?></option>
+								<option value="deepseek" <?php selected( SWI_Plugin::get_option( 'model_provider', 'gemini' ), 'deepseek' ); ?>><?php esc_html_e( 'DeepSeek (cheaper)', 'swi' ); ?></option>
+							</select>
+							<p class="description"><?php esc_html_e( 'Which LLM analyzes product HTML and fixes profiles. DeepSeek is cheaper; Gemini handles hard-to-scrape sites more reliably.', 'swi' ); ?></p>
+						</td>
+					</tr>
+					<tr>
+						<th scope="row"><label for="swi_render_url"><?php esc_html_e( 'JS render proxy URL', 'swi' ); ?></label></th>
+						<td>
+							<input type="url" name="swi_render_url" id="swi_render_url" class="regular-text" value="<?php echo esc_attr( SWI_Plugin::get_option( 'render_url', '' ) ); ?>" placeholder="http://127.0.0.1:8191" />
+							<p class="description"><?php esc_html_e( 'Optional. A FlareSolverr-compatible endpoint used to render JavaScript and bypass bot challenges (e.g. Cloudflare) on source stores. Leave blank to disable.', 'swi' ); ?></p>
 						</td>
 					</tr>
 					<tr>
@@ -259,8 +288,7 @@ class SWI_Admin {
 					<th scope="row"><label for="swi_target_url"><?php esc_html_e( 'Store URL', 'swi' ); ?></label></th>
 					<td>
 						<input type="text" id="swi_target_url" class="regular-text" value="<?php echo esc_attr( $url ); ?>" placeholder="https://example-store.com" />
-						<button type="button" class="button button-secondary" id="swi-detect"><?php esc_html_e( 'Detect platform', 'swi' ); ?></button>
-						<button type="button" class="button button-primary" id="swi-discover"<?php echo $platform ? '' : ' style="display:none;"'; ?>><?php esc_html_e( 'Discover products', 'swi' ); ?></button>
+						<button type="button" class="button button-primary" id="swi-discover"><?php esc_html_e( 'Discover products', 'swi' ); ?></button>
 						<span id="swi-platform-badge" class="swi-badge <?php echo esc_attr( $platform ? 'swi-badge--' . $platform : '' ); ?>">
 							<?php echo $platform ? esc_html( ucfirst( $platform ) ) : ''; ?>
 						</span>
@@ -276,53 +304,81 @@ class SWI_Admin {
 	}
 
 	/**
-	 * Render the "Train" card: teach the scraper a new site from sample HTML.
+	 * Render the "Universal Website" card: list trained sites, add a new one,
+	 * and scrape a single product from a trained site.
 	 */
-	private function render_train_card() {
+	private function render_universal_card() {
 		?>
 		<div class="swi-card">
-			<h2><?php esc_html_e( 'Train on a new site', 'swi' ); ?></h2>
-			<p class="description"><?php esc_html_e( 'Paste the URL (or upload a saved .html file) of one simple and one variable product from the site you want to scrape. The AI analyzes the HTML and produces a scraping profile, which you review and save. After that, every product on the site can be scraped via its sitemap.', 'swi' ); ?></p>
-
-			<div class="swi-train-grid">
-				<div class="swi-train-col">
-					<h3><?php esc_html_e( '1. Simple product sample', 'swi' ); ?></h3>
-					<label class="swi-field-label" for="swi-train-simple-url"><?php esc_html_e( 'Product URL', 'swi' ); ?></label>
-					<input type="text" id="swi-train-simple-url" class="regular-text" placeholder="https://site.com/products/tee" />
-					<p class="description" style="margin:4px 0 8px;"><?php esc_html_e( '…or upload a saved .html file:', 'swi' ); ?></p>
-					<input type="file" id="swi-train-simple-file" accept=".html,.htm,text/html" />
-					<textarea id="swi-train-simple-html" class="swi-train-html" rows="6" placeholder="<?php esc_attr_e( '…or paste the page HTML here', 'swi' ); ?>"></textarea>
+			<div class="swi-universal-head">
+				<div>
+					<h2 style="margin:0;"><?php esc_html_e( 'Universal Website', 'swi' ); ?></h2>
+					<p class="description" style="margin:4px 0 0;"><?php esc_html_e( 'Websites the AI has learned to scrape (non-Shopify / non-WooCommerce stores). Select a website to scrape and import a single product from it.', 'swi' ); ?></p>
 				</div>
-
-				<div class="swi-train-col">
-					<h3><?php esc_html_e( '2. Variable product sample (optional)', 'swi' ); ?></h3>
-					<label class="swi-field-label" for="swi-train-variable-url"><?php esc_html_e( 'Product URL', 'swi' ); ?></label>
-					<input type="text" id="swi-train-variable-url" class="regular-text" placeholder="https://site.com/products/shoes" />
-					<p class="description" style="margin:4px 0 8px;"><?php esc_html_e( '…or upload a saved .html file:', 'swi' ); ?></p>
-					<input type="file" id="swi-train-variable-file" accept=".html,.htm,text/html" />
-					<textarea id="swi-train-variable-html" class="swi-train-html" rows="6" placeholder="<?php esc_attr_e( '…or paste the page HTML here', 'swi' ); ?>"></textarea>
-				</div>
+				<button type="button" class="button button-primary" id="swi-universal-add-toggle"><?php esc_html_e( 'Add new website', 'swi' ); ?></button>
 			</div>
 
-			<label class="swi-field-label" for="swi-train-domain"><?php esc_html_e( 'Site domain (used as the profile key)', 'swi' ); ?></label>
-			<input type="text" id="swi-train-domain" class="regular-text" placeholder="example-store.com" />
-			<p class="description"><?php esc_html_e( 'Optional — auto-detected from the URL if left blank.', 'swi' ); ?></p>
+			<div id="swi-universal-list" style="margin-top:16px;"></div>
 
-			<p class="submit">
-				<button type="button" class="button button-primary button-hero" id="swi-train-analyze"><?php esc_html_e( 'Analyze samples', 'swi' ); ?></button>
-				<span id="swi-train-status" class="swi-status"></span>
-			</p>
-		</div>
+			<div class="swi-card swi-card--inset" id="swi-universal-add" style="display:none;">
+				<h2><?php esc_html_e( 'Add a new website', 'swi' ); ?></h2>
+				<p class="description"><?php esc_html_e( 'Give the AI one simple and one variable product URL. It learns the site\'s product structure and maps it to your store\'s product fields. After saving, the website appears in the list above.', 'swi' ); ?></p>
 
-		<div class="swi-card" id="swi-train-result" style="display:none;">
-			<h2><?php esc_html_e( '3. Review & save the profile', 'swi' ); ?></h2>
-			<div id="swi-train-preview"></div>
-			<label class="swi-field-label" for="swi-train-profile"><?php esc_html_e( 'Scraping profile (JSON — edit if needed)', 'swi' ); ?></label>
-			<textarea id="swi-train-profile" class="swi-train-profile" rows="22" spellcheck="false"></textarea>
-			<p class="submit">
-				<button type="button" class="button button-primary button-hero" id="swi-train-save"><?php esc_html_e( 'Save profile', 'swi' ); ?></button>
-				<span id="swi-train-save-status" class="swi-status"></span>
-			</p>
+				<div class="swi-train-grid">
+					<div class="swi-train-col">
+						<h3><?php esc_html_e( '1. Simple product sample', 'swi' ); ?></h3>
+						<label class="swi-field-label" for="swi-train-simple-url"><?php esc_html_e( 'Product URL', 'swi' ); ?></label>
+						<input type="text" id="swi-train-simple-url" class="regular-text" placeholder="https://site.com/products/tee" />
+					</div>
+
+					<div class="swi-train-col">
+						<h3><?php esc_html_e( '2. Variable product sample (optional)', 'swi' ); ?></h3>
+						<label class="swi-field-label" for="swi-train-variable-url"><?php esc_html_e( 'Product URL', 'swi' ); ?></label>
+						<input type="text" id="swi-train-variable-url" class="regular-text" placeholder="https://site.com/products/shoes" />
+					</div>
+				</div>
+
+				<label class="swi-field-label" for="swi-train-domain"><?php esc_html_e( 'Site domain (used as the profile key)', 'swi' ); ?></label>
+				<input type="text" id="swi-train-domain" class="regular-text" placeholder="example-store.com" />
+				<p class="description"><?php esc_html_e( 'Optional — auto-detected from the URL if left blank.', 'swi' ); ?></p>
+
+				<p class="submit">
+					<button type="button" class="button button-primary button-hero" id="swi-train-analyze"><?php esc_html_e( 'Analyze samples', 'swi' ); ?></button>
+					<span id="swi-train-status" class="swi-status"></span>
+				</p>
+
+				<div class="swi-card swi-card--inset" id="swi-train-result" style="display:none;">
+					<h2><?php esc_html_e( 'Review & save the profile', 'swi' ); ?></h2>
+
+					<div class="swi-scraped-panel">
+						<h3><?php esc_html_e( 'Scraped data', 'swi' ); ?></h3>
+						<div id="swi-train-scraped"></div>
+					</div>
+
+					<p style="margin:12px 0 4px;">
+						<button type="button" class="button button-link" id="swi-train-profile-toggle"><?php esc_html_e( 'Show profile JSON (advanced)', 'swi' ); ?></button>
+					</p>
+					<div id="swi-train-profile-wrap" style="display:none;">
+						<label class="swi-field-label" for="swi-train-profile"><?php esc_html_e( 'Scraping profile (JSON — edit if needed)', 'swi' ); ?></label>
+						<textarea id="swi-train-profile" class="swi-train-profile" rows="18" spellcheck="false"></textarea>
+					</div>
+
+					<div class="swi-fix-chat swi-fix-chat--train" style="margin-top:14px; border-top:1px solid #e2e4e7; padding-top:12px;">
+						<label class="swi-field-label"><?php esc_html_e( 'Ask the AI to fix something', 'swi' ); ?></label>
+						<div class="swi-fix-chat__messages" style="max-height:260px; overflow-y:auto; margin-bottom:10px;"></div>
+						<div class="swi-fix-chat__input-row" style="display:flex; gap:8px;">
+							<input type="text" class="swi-fix-chat__input regular-text" placeholder="e.g. the shade names are missing the volume…" style="flex:1;" />
+							<button type="button" class="button swi-fix-chat__send"><?php esc_html_e( 'Send', 'swi' ); ?></button>
+						</div>
+						<p style="margin:8px 0 0;"><span class="swi-status swi-fix-chat__status"></span></p>
+					</div>
+
+					<p class="submit">
+						<button type="button" class="button button-primary button-hero" id="swi-train-save"><?php esc_html_e( 'Save website', 'swi' ); ?></button>
+						<span id="swi-train-save-status" class="swi-status"></span>
+					</p>
+				</div>
+			</div>
 		</div>
 		<?php
 	}
@@ -350,20 +406,7 @@ class SWI_Admin {
 					<button type="button" class="button button-link-delete" id="swi-clear-products"><?php esc_html_e( 'Clear products', 'swi' ); ?></button>
 				</p>
 
-				<table class="widefat striped swi-products">
-					<thead>
-						<tr>
-							<td class="swi-col-check">
-								<input type="checkbox" id="swi-select-all" />
-							</td>
-							<th><?php esc_html_e( 'Image', 'swi' ); ?></th>
-							<th><?php esc_html_e( 'Title', 'swi' ); ?></th>
-							<th><?php esc_html_e( 'Price', 'swi' ); ?></th>
-							<th><?php esc_html_e( 'Status', 'swi' ); ?></th>
-						</tr>
-					</thead>
-					<tbody id="swi-tbody"></tbody>
-				</table>
+				<div class="swi-products-cats" id="swi-categories"></div>
 
 				<p class="submit">
 					<button type="button" class="button button-primary button-hero" id="swi-start"><?php esc_html_e( 'Import selected (0)', 'swi' ); ?></button>
@@ -409,6 +452,12 @@ class SWI_Admin {
 		SWI_Plugin::set_option( 'auto_publish', isset( $_POST['swi_auto_publish'] ) ? 1 : 0 );
 		SWI_Plugin::set_option( 'sslverify', isset( $_POST['swi_sslverify'] ) ? 1 : 0 );
 		SWI_Plugin::set_option( 'debug', isset( $_POST['swi_debug'] ) ? 1 : 0 );
+
+		$provider = isset( $_POST['swi_model_provider'] ) ? sanitize_key( wp_unslash( $_POST['swi_model_provider'] ) ) : 'gemini';
+		SWI_Plugin::set_option( 'model_provider', ( 'deepseek' === $provider ) ? 'deepseek' : 'gemini' );
+
+		$render_url = isset( $_POST['swi_render_url'] ) ? trim( (string) wp_unslash( $_POST['swi_render_url'] ) ) : '';
+		SWI_Plugin::set_option( 'render_url', esc_url_raw( $render_url ) );
 
 		wp_safe_redirect( add_query_arg( 'saved', '1', admin_url( 'admin.php?page=swi-importer&tab=settings' ) ) );
 		exit;
@@ -461,21 +510,21 @@ class SWI_Admin {
 			SWI_Plugin::set_option( 'target_url', sanitize_text_field( wp_unslash( $_POST['url'] ) ) );
 		}
 
-		$url      = SWI_Plugin::get_option( 'target_url' );
-		$platform = SWI_Plugin::get_option( 'platform' );
+		$url = SWI_Plugin::get_option( 'target_url' );
 
 		if ( ! $url ) {
 			wp_send_json_error( array( 'message' => __( 'Please enter a store URL first.', 'swi' ) ) );
 		}
 
-		if ( ! $platform ) {
-			$detect = SWI_Detector::detect( $url );
-			if ( is_wp_error( $detect ) ) {
-				wp_send_json_error( array( 'message' => $detect->get_error_message() ) );
-			}
-			$platform = $detect['platform'];
-			SWI_Plugin::set_option( 'platform', $platform );
+		// Always detect the platform fresh from the current URL (there is no
+		// separate "Detect platform" button anymore, and a stale stored value
+		// would otherwise break discovery).
+		$detect = SWI_Detector::detect( $url );
+		if ( is_wp_error( $detect ) ) {
+			wp_send_json_error( array( 'message' => $detect->get_error_message() ) );
 		}
+		$platform = $detect['platform'];
+		SWI_Plugin::set_option( 'platform', $platform );
 
 		// 1. Try the bulk JSON endpoint first (fast, full previews).
 		$bulk     = SWI_Crawler::bulk_products( $url, $platform );
@@ -491,7 +540,7 @@ class SWI_Admin {
 			foreach ( $urls as $u ) {
 				$products[] = array(
 					'source_url' => $u,
-					'title'      => '',
+					'title'      => $this->title_from_product_url( $u ),
 					'thumbnail'  => '',
 					'price'      => '',
 					'currency'   => '',
@@ -503,15 +552,136 @@ class SWI_Admin {
 			wp_send_json_error( array( 'message' => __( 'No products were discovered on this site.', 'swi' ) ) );
 		}
 
+		$categories = $this->build_category_tree( $products, $platform, $url );
+
 		wp_send_json_success(
 			array(
-				'count'    => count( $products ),
-				'products' => $products,
-				'previews' => $bulk_ok,
-				'source'   => $bulk_ok ? 'bulk' : 'sitemap',
-				'platform' => $platform,
+				'count'      => count( $products ),
+				'products'   => $products,
+				'categories' => $categories,
+				'previews'   => $bulk_ok,
+				'source'     => $bulk_ok ? 'bulk' : 'sitemap',
+				'platform'   => $platform,
 			)
 		);
+	}
+
+	/**
+	 * Build a category tree (top-level categories → subcategories → products)
+	 * for the folded "Discover products" list.
+	 *
+	 * WooCommerce uses the Store API category hierarchy; Shopify falls back to
+	 * product_type as flat top-level groups.
+	 *
+	 * @param array  $products Flat product list.
+	 * @param string $platform Platform slug.
+	 * @param string $url      Base URL.
+	 * @return array Category tree.
+	 */
+	private function build_category_tree( $products, $platform, $url ) {
+		if ( 'woocommerce' !== $platform ) {
+			// Shopify / generic: group by first category name (product_type).
+			$groups = array();
+			foreach ( $products as $p ) {
+				$name = ! empty( $p['categories'][0]['name'] ) ? $p['categories'][0]['name'] : __( 'Uncategorized', 'swi' );
+				if ( ! isset( $groups[ $name ] ) ) {
+					$groups[ $name ] = array();
+				}
+				$groups[ $name ][] = $p;
+			}
+			$tree = array();
+			foreach ( $groups as $name => $items ) {
+				$tree[] = array(
+					'id'       => 0,
+					'name'     => $name,
+					'count'    => count( $items ),
+					'children' => $items,
+				);
+			}
+			return $tree;
+		}
+
+		// WooCommerce: map category id → product list (products attach to their
+		// deepest category), then assemble a hierarchy with a recursive helper.
+		$cats = SWI_Crawler::woocommerce_categories( $url );
+
+		$by_id = array(); // id => [name,parent,count]
+		foreach ( $cats as $c ) {
+			$by_id[ $c['id'] ] = array(
+				'id'     => $c['id'],
+				'name'   => $c['name'],
+				'parent' => $c['parent'],
+				'count'  => $c['count'],
+			);
+		}
+
+		// Orphaned categories (their parent lives on a later API page) would be
+		// dropped from the tree — promote them to top-level so their products
+		// still appear.
+		foreach ( $by_id as $id => $cat ) {
+			if ( (int) $cat['parent'] !== 0 && ! isset( $by_id[ (int) $cat['parent'] ] ) ) {
+				$by_id[ $id ]['parent'] = 0;
+			}
+		}
+
+		// category id → list of products assigned directly to it.
+		$cat_products  = array();
+		$uncategorized = array();
+		foreach ( $products as $p ) {
+			$ids = array();
+			foreach ( (array) $p['categories'] as $pc ) {
+				if ( ! empty( $pc['id'] ) && isset( $by_id[ (int) $pc['id'] ] ) ) {
+					$ids[] = (int) $pc['id'];
+				}
+			}
+			if ( empty( $ids ) ) {
+				$uncategorized[] = $p;
+				continue;
+			}
+			$deepest = end( $ids );
+			if ( ! isset( $cat_products[ $deepest ] ) ) {
+				$cat_products[ $deepest ] = array();
+			}
+			$cat_products[ $deepest ][] = $p;
+		}
+
+		// Build the tree (by reference to parent id). Each node's `children`
+		// mixes subcategory nodes and product leaves.
+		$build = function ( $parent_id ) use ( &$build, $by_id, $cat_products ) {
+			$out = array();
+			foreach ( $by_id as $id => $cat ) {
+				if ( (int) $cat['parent'] !== (int) $parent_id ) {
+					continue;
+				}
+				$node = array(
+					'id'       => $id,
+					'name'     => $cat['name'],
+					'count'    => $cat['count'],
+					'children' => $build( $id ),
+				);
+				// Append products attached directly to this category.
+				if ( isset( $cat_products[ $id ] ) ) {
+					foreach ( $cat_products[ $id ] as $p ) {
+						$node['children'][] = $p;
+					}
+				}
+				$out[] = $node;
+			}
+			return $out;
+		};
+
+		$tree = $build( 0 );
+
+		if ( ! empty( $uncategorized ) ) {
+			$tree[] = array(
+				'id'       => -1,
+				'name'     => __( 'Uncategorized', 'swi' ),
+				'count'    => count( $uncategorized ),
+				'children' => $uncategorized,
+			);
+		}
+
+		return $tree;
 	}
 
 	/**
@@ -644,7 +814,13 @@ class SWI_Admin {
 			wp_send_json_error( array( 'message' => __( 'Provide a URL, an uploaded .html file, or pasted HTML for at least one sample product.', 'swi' ) ) );
 		}
 
-		$profile = SWI_AI::analyze( $html_simple, $html_variable );
+		// Sample URL (used to absolutize relative images + as the audit base).
+		$base = isset( $_POST['variable_url'] ) && '' !== trim( (string) $_POST['variable_url'] ) ? (string) $_POST['variable_url'] : ( isset( $_POST['simple_url'] ) ? (string) $_POST['simple_url'] : '' );
+
+		// Generate the profile with a full agent loop: the AI investigates the
+		// HTML with tools (search / run / inspect) until it's confident the
+		// profile extracts everything correctly.
+		$profile = SWI_AI::analyze_with_agent( $html_simple, $html_variable, $base );
 		if ( is_wp_error( $profile ) ) {
 			wp_send_json_error( array( 'message' => $profile->get_error_message() ) );
 		}
@@ -659,21 +835,35 @@ class SWI_Admin {
 		$domain = isset( $_POST['domain'] ) ? sanitize_text_field( wp_unslash( $_POST['domain'] ) ) : '';
 		$domain = SWI_Profile::normalize_domain( $domain );
 		if ( '' === $domain ) {
-			$base_url = isset( $_POST['simple_url'] ) && '' !== trim( (string) $_POST['simple_url'] )
-				? (string) $_POST['simple_url']
-				: ( isset( $_POST['variable_url'] ) ? (string) $_POST['variable_url'] : '' );
-			$domain = SWI_Profile::normalize_domain( $base_url );
+			$base_url = '' !== $base ? $base : ( isset( $_POST['simple_url'] ) && '' !== trim( (string) $_POST['simple_url'] ) ? (string) $_POST['simple_url'] : '' );
+			$domain   = SWI_Profile::normalize_domain( $base_url );
 		}
 
-		// Preview: apply the profile to whichever sample HTML we have.
+		// Preview: apply the profile to whichever sample HTML we have, and build
+		// BOTH the raw "scraped data" (left panel) and our editable "product
+		// data sheet" (right panel).
 		$preview = array();
+		$scraped = array();
+		$sheet   = array();
+		$locked  = array();
 		$sample  = ( '' !== $html_variable ) ? $html_variable : $html_simple;
-		$base    = isset( $_POST['variable_url'] ) && '' !== trim( (string) $_POST['variable_url'] ) ? (string) $_POST['variable_url'] : ( isset( $_POST['simple_url'] ) ? (string) $_POST['simple_url'] : '' );
 
-		if ( '' !== $sample && '' !== $base ) {
+		if ( '' !== $sample ) {
 			$data = SWI_Generic_Scraper::scrape_html( $sample, $base, $valid );
 			if ( ! is_wp_error( $data ) ) {
 				$preview = $this->preview_summary( $data );
+				$scraped = $data;
+				$sheet   = $this->product_sheet( $data );
+			}
+		}
+
+		// Restore any persisted manual edits (locked fields) for this product,
+		// so re-analyzing the same sample doesn't wipe the user's corrections.
+		if ( '' !== $base ) {
+			$edits  = $this->get_sheet_edits( $domain, $base );
+			$locked = $edits['locked'];
+			if ( ! empty( $edits['locked'] ) && ! empty( $sheet ) ) {
+				$sheet = $this->apply_sheet_locks( $sheet, $edits );
 			}
 		}
 
@@ -682,6 +872,9 @@ class SWI_Admin {
 				'domain'  => $domain,
 				'profile' => $valid,
 				'preview' => $preview,
+				'scraped' => $scraped,
+				'sheet'   => $sheet,
+				'locked'  => $locked,
 			)
 		);
 	}
@@ -700,17 +893,491 @@ class SWI_Admin {
 			wp_send_json_error( array( 'message' => __( 'The profile is not valid JSON.', 'swi' ) ) );
 		}
 
+		// Persist the site base URL (derived from the sample URL) so "Show
+		// Products" knows where to crawl later.
+		$sample_url = isset( $_POST['variable_url'] ) && '' !== trim( (string) $_POST['variable_url'] ) ? (string) $_POST['variable_url'] : ( isset( $_POST['simple_url'] ) ? (string) $_POST['simple_url'] : '' );
+		if ( '' !== $sample_url ) {
+			$decoded['base_url'] = SWI_Profile::base_url( $sample_url );
+		}
+
 		$saved = SWI_Profile::save( $domain, $decoded );
 		if ( is_wp_error( $saved ) ) {
 			wp_send_json_error( array( 'message' => $saved->get_error_message() ) );
 		}
 
+		// Persist the edited product sheet (and locked/correct fields) so the
+		// user's manual corrections survive a re-analyze of the same product.
+		$sheet_raw = isset( $_POST['sheet'] ) ? wp_unslash( $_POST['sheet'] ) : '';
+		$locked    = isset( $_POST['locked'] ) ? json_decode( wp_unslash( $_POST['locked'] ), true ) : array();
+		$locked    = is_array( $locked ) ? $locked : array();
+		$sheet     = json_decode( $sheet_raw, true );
+		$sheet     = is_array( $sheet ) ? $sheet : array();
+
+		$sample_url = isset( $_POST['variable_url'] ) && '' !== trim( (string) $_POST['variable_url'] ) ? (string) $_POST['variable_url'] : ( isset( $_POST['simple_url'] ) ? (string) $_POST['simple_url'] : '' );
+		$norm       = SWI_Profile::normalize_domain( '' !== $sample_url ? $sample_url : $domain );
+		if ( '' !== $sample_url ) {
+			$this->save_sheet_edits( $norm, $sample_url, $sheet, $locked );
+		}
+
 		wp_send_json_success(
 			array(
-				'message' => __( 'Profile saved.', 'swi' ),
+				'message' => __( 'Website saved.', 'swi' ),
 				'domain'  => $saved['domain'],
 			)
 		);
+	}
+
+	/**
+	 * AJAX: list every saved universal-website profile.
+	 */
+	public function ajax_swi_profiles_list() {
+		$this->verify_ajax();
+
+		$profiles = SWI_Profile::all();
+		$list     = array();
+
+		foreach ( $profiles as $domain => $profile ) {
+			$list[] = array(
+				'domain'     => (string) $domain,
+				'trained_at' => isset( $profile['trained_at'] ) ? (string) $profile['trained_at'] : '',
+			);
+		}
+
+		// Newest first.
+		usort(
+			$list,
+			function ( $a, $b ) {
+				return strcmp( (string) $b['trained_at'], (string) $a['trained_at'] );
+			}
+		);
+
+		wp_send_json_success( array( 'profiles' => $list ) );
+	}
+
+	/**
+	 * AJAX: delete a saved universal-website profile.
+	 */
+	public function ajax_swi_profile_delete() {
+		$this->verify_ajax();
+
+		$domain = isset( $_POST['domain'] ) ? sanitize_text_field( wp_unslash( $_POST['domain'] ) ) : '';
+		if ( '' === $domain ) {
+			wp_send_json_error( array( 'message' => __( 'No website specified.', 'swi' ) ) );
+		}
+
+		$deleted = SWI_Profile::delete( $domain );
+		if ( ! $deleted ) {
+			wp_send_json_error( array( 'message' => __( 'That website has no saved profile.', 'swi' ) ) );
+		}
+
+		wp_send_json_success( array( 'message' => __( 'Website removed.', 'swi' ) ) );
+	}
+
+	/**
+	 * AJAX: scrape and import a single product URL using a trained profile.
+	 *
+	 * The "Universal Website" flow: pick a website, paste one product URL, and
+	 * it is scraped with the saved profile and imported into WooCommerce.
+	 */
+	public function ajax_swi_universal_scrape() {
+		$this->verify_ajax();
+
+		$url    = isset( $_POST['url'] ) ? sanitize_text_field( wp_unslash( $_POST['url'] ) ) : '';
+		$domain = isset( $_POST['domain'] ) ? sanitize_text_field( wp_unslash( $_POST['domain'] ) ) : '';
+
+		if ( '' === $url ) {
+			wp_send_json_error( array( 'message' => __( 'Enter a product URL first.', 'swi' ) ) );
+		}
+
+		// Image processing options: white square background + padding.
+		$white_bg = isset( $_POST['white_bg'] ) ? (int) $_POST['white_bg'] : 0;
+		$padding  = isset( $_POST['padding'] ) ? (int) $_POST['padding'] : 0;
+		$white_bg = in_array( $white_bg, array( 800, 1000 ), true ) ? $white_bg : 0;
+		$padding  = in_array( $padding, array( 50, 60, 70, 80, 90 ), true ) ? $padding : 0;
+		$options  = array(
+			'white_bg' => $white_bg,
+			'padding'  => $padding,
+		);
+
+		// Resolve the profile from the explicit domain, falling back to the URL.
+		$profile = SWI_Profile::get( '' !== $domain ? $domain : $url );
+		if ( null === $profile ) {
+			wp_send_json_error( array( 'message' => __( 'No saved profile for this website. Add it first, then scrape.', 'swi' ) ) );
+		}
+
+		$data = SWI_Scraper::scrape( $url, 'generic' );
+		if ( is_wp_error( $data ) ) {
+			wp_send_json_error( array( 'message' => $data->get_error_message() ) );
+		}
+
+		try {
+			$existed    = (bool) SWI_Importer::find_existing( $url );
+			$product_id = SWI_Importer::import( $data, $url, $options );
+			$title      = ! empty( $data['title'] ) ? $data['title'] : $url;
+
+			wp_send_json_success(
+				array(
+					'status'     => $existed ? 'updated' : 'imported',
+					'title'      => $title,
+					'product_id' => $product_id,
+					'preview'    => $this->preview_summary( $data ),
+				)
+			);
+		} catch ( \Throwable $e ) {
+			wp_send_json_error( array( 'message' => $e->getMessage() ) );
+		}
+	}
+
+	/**
+	 * AJAX: list the products of a trained site, grouped into categories.
+	 *
+	 * Discovers product URLs via the site's sitemap and derives a category per
+	 * product from its URL path (best-effort; no public category API exists for
+	 * generic sites). Returns a tree of categories → products (URL + a
+	 * humanized placeholder title), which the browser renders as an accordion.
+	 */
+	public function ajax_swi_universal_catalog() {
+		$this->verify_ajax();
+
+		$domain = isset( $_POST['domain'] ) ? sanitize_text_field( wp_unslash( $_POST['domain'] ) ) : '';
+		if ( '' === $domain ) {
+			wp_send_json_error( array( 'message' => __( 'No website specified.', 'swi' ) ) );
+		}
+
+		$profile = SWI_Profile::get( $domain );
+		if ( null === $profile ) {
+			wp_send_json_error( array( 'message' => __( 'No saved profile for this website.', 'swi' ) ) );
+		}
+
+		$base = ! empty( $profile['base_url'] ) ? (string) $profile['base_url'] : SWI_Profile::base_url( $domain );
+
+		$urls = SWI_Crawler::discover_limited( $base, 'generic', 500 );
+		if ( is_wp_error( $urls ) ) {
+			wp_send_json_error( array( 'message' => $urls->get_error_message() ) );
+		}
+
+		$categories = array();
+		foreach ( $urls as $url ) {
+			$url   = trim( (string) $url );
+			$cat   = $this->derive_product_category( $url );
+			$title = $this->title_from_product_url( $url );
+
+			$key = strtolower( $cat );
+			if ( ! isset( $categories[ $key ] ) ) {
+				$categories[ $key ] = array(
+					'name'     => $cat,
+					'products' => array(),
+				);
+			}
+			$categories[ $key ]['products'][] = array(
+				'url'   => $url,
+				'title' => $title,
+			);
+		}
+
+		// Order categories alphabetically, then products by title.
+		uksort( $categories, 'strcasecmp' );
+		foreach ( $categories as &$category ) {
+			usort(
+				$category['products'],
+				function ( $a, $b ) {
+					return strcasecmp( (string) $a['title'], (string) $b['title'] );
+				}
+			);
+		}
+		unset( $category );
+
+		wp_send_json_success(
+			array(
+				'count'      => count( $urls ),
+				'categories' => array_values( $categories ),
+			)
+		);
+	}
+
+	/**
+	 * Derive a category label from a product URL path (best-effort for generic
+	 * sites with no category API).
+	 *
+	 * Handles explicit category markers (/category/, /collections/,
+	 * /catalogue/category/) and falls back to the first meaningful path segment
+	 * (e.g. Notino's brand segment "dior"). Returns "All" when no structure.
+	 *
+	 * @param string $url Product URL.
+	 * @return string
+	 */
+	private function derive_product_category( $url ) {
+		$path = (string) wp_parse_url( $url, PHP_URL_PATH );
+		$path = trim( $path, '/' );
+		if ( '' === $path ) {
+			return 'All';
+		}
+
+		$segments = explode( '/', $path );
+
+		// Drop a leading language segment ("en", "ar", "el", …).
+		if ( isset( $segments[0] ) && preg_match( '/^[a-z]{2,3}(-[a-z]{2})?$/i', $segments[0] ) && count( $segments ) > 2 ) {
+			array_shift( $segments );
+		}
+
+		// Explicit category markers.
+		$markers = array( 'category', 'collections', 'catalogue' );
+		foreach ( $segments as $i => $seg ) {
+			$lower = strtolower( $seg );
+			if ( 'catalogue' === $lower && isset( $segments[ $i + 1 ] ) && 'category' === strtolower( $segments[ $i + 1 ] ) ) {
+				return $this->humanize_segment( isset( $segments[ $i + 2 ] ) ? $segments[ $i + 2 ] : 'All' );
+			}
+			if ( in_array( $lower, $markers, true ) && isset( $segments[ $i + 1 ] ) ) {
+				return $this->humanize_segment( $segments[ $i + 1 ] );
+			}
+		}
+
+		// Fallback: first meaningful segment (e.g. "dior" in Notino), but only
+		// when there's a product slug after it.
+		if ( count( $segments ) >= 2 ) {
+			return $this->humanize_segment( $segments[0] );
+		}
+
+		return 'All';
+	}
+
+	/**
+	 * Humanize a URL path segment into a display label.
+	 *
+	 * @param string $segment URL path segment.
+	 * @return string
+	 */
+	private function humanize_segment( $segment ) {
+		$segment = urldecode( (string) $segment );
+		$segment = preg_replace( '/\.(html?|php)$/i', '', $segment );
+		$segment = str_replace( array( '-', '_' ), ' ', $segment );
+		$segment = trim( preg_replace( '/\s+/', ' ', $segment ) );
+		return '' !== $segment ? ucwords( $segment ) : 'All';
+	}
+
+	/**
+	 * Humanize a product URL into a placeholder title (real title is fetched at
+	 * import time by the profile).
+	 *
+	 * @param string $url Product URL.
+	 * @return string
+	 */
+	private function title_from_product_url( $url ) {
+		$path = (string) wp_parse_url( $url, PHP_URL_PATH );
+		$path = trim( $path, '/' );
+		$seg  = explode( '/', $path );
+		$slug = end( $seg );
+		return $this->humanize_segment( $slug );
+	}
+
+	/**
+	 * AJAX: fix a scraping profile via the AI chat.
+	 *
+	 * The user describes a problem ("the shade names are wrong", "description
+	 * has HTML entities"). The plugin loads the profile, re-scrapes the product
+	 * (for the data the user is complaining about + the HTML to search), sends
+	 * it to the AI fix endpoint, and returns a corrected profile + explanation
+	 * + a preview of the corrected extraction.
+	 */
+	public function ajax_swi_ai_fix() {
+		$this->verify_ajax();
+
+		$domain      = isset( $_POST['domain'] ) ? sanitize_text_field( wp_unslash( $_POST['domain'] ) ) : '';
+		$url         = isset( $_POST['url'] ) ? sanitize_text_field( wp_unslash( $_POST['url'] ) ) : '';
+		$instruction = isset( $_POST['instruction'] ) ? sanitize_textarea_field( wp_unslash( $_POST['instruction'] ) ) : '';
+		$history     = isset( $_POST['history'] ) ? json_decode( wp_unslash( $_POST['history'] ), true ) : array();
+		$history     = is_array( $history ) ? $history : array();
+
+		if ( '' === trim( $instruction ) ) {
+			wp_send_json_error( array( 'message' => __( 'Describe the problem you want fixed.', 'swi' ) ) );
+		}
+		if ( '' === $url ) {
+			wp_send_json_error( array( 'message' => __( 'Scrape the product first, then describe the problem.', 'swi' ) ) );
+		}
+
+		$profile = SWI_Profile::get( '' !== $domain ? $domain : $url );
+		if ( null === $profile ) {
+			wp_send_json_error( array( 'message' => __( 'No saved profile for this website.', 'swi' ) ) );
+		}
+
+		// Scrape the product (what the user sees) + fetch the HTML to search.
+		$data = SWI_Scraper::scrape( $url, 'generic' );
+		if ( is_wp_error( $data ) ) {
+			wp_send_json_error( array( 'message' => $data->get_error_message() ) );
+		}
+		$html = SWI_HTTP::get( $url );
+		if ( is_wp_error( $html ) ) {
+			wp_send_json_error( array( 'message' => $html->get_error_message() ) );
+		}
+
+		// Compact the data we send to the AI (truncate long text, cap variants).
+		$ai_data = $this->ai_data_snapshot( $data );
+
+		$result = SWI_AI::fix_product( $instruction, $profile, $ai_data, $html, $history );
+		if ( is_wp_error( $result ) ) {
+			wp_send_json_error( array( 'message' => $result->get_error_message() ) );
+		}
+
+		$valid = SWI_Profile::validate( $result['profile'] );
+		if ( is_wp_error( $valid ) ) {
+			wp_send_json_error( array( 'message' => $valid->get_error_message() ) );
+		}
+
+		// Preview the corrected profile against the same HTML.
+		$preview = array();
+		$fixed   = SWI_Generic_Scraper::scrape_html( $html, $url, $valid );
+		if ( ! is_wp_error( $fixed ) ) {
+			$preview = $this->preview_summary( $fixed );
+		}
+
+		wp_send_json_success(
+			array(
+				'profile'     => $valid,
+				'explanation' => isset( $result['explanation'] ) ? (string) $result['explanation'] : '',
+				'changes'     => isset( $result['changes'] ) ? $result['changes'] : array(),
+				'preview'     => $preview,
+			)
+		);
+	}
+
+	/**
+	 * AJAX: fix an UNSAVED profile from the "Add new website" flow.
+	 *
+	 * Called from the chat shown after "Analyze samples". The profile hasn't
+	 * been saved yet (it lives in the textarea), so this re-fetches the sample
+	 * HTML (URL or pasted HTML) and asks the AI to correct the profile from a
+	 * natural-language instruction. Returns the corrected profile + preview.
+	 */
+	public function ajax_swi_ai_fix_train() {
+		$this->verify_ajax();
+
+		$instruction = isset( $_POST['instruction'] ) ? sanitize_textarea_field( wp_unslash( $_POST['instruction'] ) ) : '';
+		$profile_raw = isset( $_POST['profile'] ) ? wp_unslash( $_POST['profile'] ) : ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized — JSON, validated below.
+		$history     = isset( $_POST['history'] ) ? json_decode( wp_unslash( $_POST['history'] ), true ) : array();
+		$history     = is_array( $history ) ? $history : array();
+		$sheet       = isset( $_POST['sheet'] ) ? json_decode( wp_unslash( $_POST['sheet'] ), true ) : array();
+		$sheet       = is_array( $sheet ) ? $sheet : array();
+		$locked      = isset( $_POST['locked'] ) ? json_decode( wp_unslash( $_POST['locked'] ), true ) : array();
+		$locked      = is_array( $locked ) ? array_values( array_map( 'strval', $locked ) ) : array();
+
+		if ( '' === trim( $instruction ) ) {
+			wp_send_json_error( array( 'message' => __( 'Describe the problem you want fixed.', 'swi' ) ) );
+		}
+
+		$profile = json_decode( $profile_raw, true );
+		if ( ! is_array( $profile ) || JSON_ERROR_NONE !== json_last_error() ) {
+			wp_send_json_error( array( 'message' => __( 'The current profile is not valid JSON.', 'swi' ) ) );
+		}
+
+		// Re-fetch the sample HTML (same precedence as the analyze step).
+		$html_simple   = $this->train_sample_html( 'simple' );
+		$html_variable = $this->train_sample_html( 'variable' );
+		if ( is_wp_error( $html_simple ) ) {
+			wp_send_json_error( array( 'message' => $html_simple->get_error_message() ) );
+		}
+		if ( is_wp_error( $html_variable ) ) {
+			wp_send_json_error( array( 'message' => $html_variable->get_error_message() ) );
+		}
+
+		$sample = '' !== $html_variable ? $html_variable : $html_simple;
+		if ( '' === $sample ) {
+			wp_send_json_error( array( 'message' => __( 'No sample HTML to work from. Re-run "Analyze samples" first.', 'swi' ) ) );
+		}
+
+		$base = isset( $_POST['variable_url'] ) && '' !== trim( (string) $_POST['variable_url'] ) ? (string) $_POST['variable_url'] : ( isset( $_POST['simple_url'] ) ? (string) $_POST['simple_url'] : '' );
+
+		// Scrape the sample with the CURRENT profile to show the AI what's
+		// coming out wrong.
+		$data = SWI_Generic_Scraper::scrape_html( $sample, $base, $profile );
+		if ( is_wp_error( $data ) ) {
+			wp_send_json_error( array( 'message' => $data->get_error_message() ) );
+		}
+
+		$ai_data = $this->ai_data_snapshot( $data );
+
+		$result = SWI_AI::fix_product( $instruction, $profile, $ai_data, $sample, $history, $sheet, $locked );
+		if ( is_wp_error( $result ) ) {
+			wp_send_json_error( array( 'message' => $result->get_error_message() ) );
+		}
+
+		$valid = SWI_Profile::validate( $result['profile'] );
+		if ( is_wp_error( $valid ) ) {
+			wp_send_json_error( array( 'message' => $valid->get_error_message() ) );
+		}
+
+		// Preview the corrected profile against the same sample HTML, and
+		// rebuild the editable product data sheet.
+		$preview = array();
+		$sheet_out = array();
+		$fixed   = SWI_Generic_Scraper::scrape_html( $sample, $base, $valid );
+		if ( ! is_wp_error( $fixed ) ) {
+			$preview   = $this->preview_summary( $fixed );
+			$sheet_out = $this->product_sheet( $fixed );
+		}
+
+		// Re-apply the user's locked (correct) values so the AI can't clobber
+		// fields they already confirmed/edited.
+		if ( ! empty( $locked ) && ! empty( $sheet_out ) ) {
+			$sheet_out = $this->apply_sheet_locks(
+				$sheet_out,
+				array( 'sheet' => $sheet, 'locked' => $locked )
+			);
+		}
+
+		// Persist the user's edits (locked fields) for this product.
+		$norm = SWI_Profile::normalize_domain( '' !== $base ? $base : '' );
+		if ( '' !== $base && '' !== $norm ) {
+			$this->save_sheet_edits( $norm, $base, $sheet_out, $locked );
+		}
+
+		wp_send_json_success(
+			array(
+				'profile'     => $valid,
+				'explanation' => isset( $result['explanation'] ) ? (string) $result['explanation'] : '',
+				'changes'     => isset( $result['changes'] ) ? $result['changes'] : array(),
+				'preview'     => $preview,
+				'sheet'       => $sheet_out,
+				'locked'      => $locked,
+				'scraped'     => is_wp_error( $fixed ) ? array() : $fixed,
+			)
+		);
+	}
+
+	/**
+	 * Build a compact snapshot of scraped data to send to the AI (so it can
+	 * understand exactly what the user is seeing, without huge payloads).
+	 *
+	 * @param array $data Scraped product data.
+	 * @return array
+	 */
+	private function ai_data_snapshot( $data ) {
+		$snap = array(
+			'type'        => isset( $data['type'] ) ? $data['type'] : 'simple',
+			'title'       => isset( $data['title'] ) ? $data['title'] : '',
+			'price'       => isset( $data['price'] ) ? $data['price'] : '',
+			'sale_price'  => isset( $data['sale_price'] ) ? $data['sale_price'] : '',
+			'currency'    => isset( $data['currency'] ) ? $data['currency'] : '',
+			'sku'         => isset( $data['sku'] ) ? $data['sku'] : '',
+			'description' => isset( $data['description'] ) ? wp_trim_words( wp_strip_all_tags( (string) $data['description'] ), 60, '…' ) : '',
+			'categories'  => isset( $data['categories'] ) ? array_values( (array) $data['categories'] ) : array(),
+			'images_count' => isset( $data['images'] ) ? count( (array) $data['images'] ) : 0,
+			'variants'    => array(),
+		);
+
+		if ( ! empty( $data['variants'] ) && is_array( $data['variants'] ) ) {
+			foreach ( array_slice( $data['variants'], 0, 30 ) as $v ) {
+				$snap['variants'][] = array(
+					'attributes' => isset( $v['attributes'] ) ? $v['attributes'] : array(),
+					'price'      => isset( $v['price'] ) ? $v['price'] : '',
+					'sku'        => isset( $v['sku'] ) ? $v['sku'] : '',
+				);
+			}
+			if ( count( $data['variants'] ) > 30 ) {
+				$snap['variants_truncated'] = count( $data['variants'] );
+			}
+		}
+
+		return $snap;
 	}
 
 	/**
@@ -787,6 +1454,182 @@ class SWI_Admin {
 		}
 
 		return $summary;
+	}
+
+	/**
+	 * Build the "product data sheet" — our target WooCommerce product schema,
+	 * filled from the scraped data. This is the structure the AI is taught to
+	 * map to, and what the reviewer edits in the right-hand panel:
+	 *
+	 *   name, short_description, description, regular_price, sale_price,
+	 *   currency, sku, images[], attributes[{name,type,values[{value,color,
+	 *   image}]}], variations[{attributes,price,sale_price,sku,image}]
+	 *
+	 * Attributes are derived from the variant attribute keys, with color/image
+	 * swatches merged in from the scraper's swatch map.
+	 *
+	 * @param array $data Normalized scraped product data.
+	 * @return array
+	 */
+	private function product_sheet( $data ) {
+		// ---- Attribute values (from variants) ----------------------------
+		$attr_values = array(); // label => ordered unique values.
+		$attr_order  = array();
+		foreach ( (array) $data['variants'] as $v ) {
+			foreach ( (array) $v['attributes'] as $name => $value ) {
+				$name  = (string) $name;
+				$value = (string) $value;
+				if ( '' === $name ) {
+					continue;
+				}
+				if ( ! isset( $attr_values[ $name ] ) ) {
+					$attr_values[ $name ] = array();
+					$attr_order[]         = $name;
+				}
+				if ( '' !== $value && ! in_array( $value, $attr_values[ $name ], true ) ) {
+					$attr_values[ $name ][] = $value;
+				}
+			}
+		}
+
+		// ---- Swatch lookup (value/term name → color/image, attr type) -----
+		$swatch_color = array();
+		$swatch_image = array();
+		$attr_type    = array();
+		foreach ( (array) $data['swatches'] as $tax => $sw ) {
+			$label = ! empty( $sw['name'] ) ? (string) $sw['name'] : (string) $tax;
+			$type  = isset( $sw['type'] ) ? (string) $sw['type'] : 'select';
+			if ( false !== strpos( $type, 'image' ) ) {
+				$type = 'image';
+			} elseif ( false !== strpos( $type, 'color' ) ) {
+				$type = 'color';
+			} else {
+				$type = 'select';
+			}
+			$attr_type[ $label ] = $type;
+			foreach ( (array) $sw['terms'] as $slug => $term ) {
+				$term_name = ! empty( $term['name'] ) ? (string) $term['name'] : (string) $slug;
+				if ( ! empty( $term['color'] ) ) {
+					$swatch_color[ $term_name ] = (string) $term['color'];
+				}
+				if ( ! empty( $term['image'] ) ) {
+					$swatch_image[ $term_name ] = (string) $term['image'];
+				}
+			}
+		}
+
+		// ---- Attributes ---------------------------------------------------
+		$attributes = array();
+		foreach ( $attr_order as $name ) {
+			$values = array();
+			foreach ( $attr_values[ $name ] as $value ) {
+				$values[] = array(
+					'value' => $value,
+					'color' => isset( $swatch_color[ $value ] ) ? $swatch_color[ $value ] : '',
+					'image' => isset( $swatch_image[ $value ] ) ? $swatch_image[ $value ] : '',
+				);
+			}
+			$attributes[] = array(
+				'name'   => $name,
+				'type'   => isset( $attr_type[ $name ] ) ? $attr_type[ $name ] : 'select',
+				'values' => $values,
+			);
+		}
+
+		// ---- Variations ----------------------------------------------------
+		$variations = array();
+		foreach ( (array) $data['variants'] as $v ) {
+			$variations[] = array(
+				'attributes' => isset( $v['attributes'] ) ? $v['attributes'] : array(),
+				'price'      => isset( $v['price'] ) ? (string) $v['price'] : '',
+				'sale_price' => isset( $v['sale_price'] ) ? (string) $v['sale_price'] : '',
+				'sku'        => isset( $v['sku'] ) ? (string) $v['sku'] : '',
+				'image'      => isset( $v['image'] ) ? (string) $v['image'] : '',
+			);
+		}
+
+		return array(
+			'name'              => isset( $data['title'] ) ? (string) $data['title'] : '',
+			'short_description' => isset( $data['short_description'] ) ? (string) $data['short_description'] : '',
+			'description'       => isset( $data['description'] ) ? (string) $data['description'] : '',
+			'regular_price'     => isset( $data['price'] ) ? (string) $data['price'] : '',
+			'sale_price'        => isset( $data['sale_price'] ) ? (string) $data['sale_price'] : '',
+			'currency'          => isset( $data['currency'] ) ? (string) $data['currency'] : '',
+			'sku'               => isset( $data['sku'] ) ? (string) $data['sku'] : '',
+			'images'            => isset( $data['images'] ) ? array_values( array_map( 'strval', (array) $data['images'] ) ) : array(),
+			'attributes'        => $attributes,
+			'variations'        => $variations,
+		);
+	}
+
+	/**
+	 * Option key for persisted sheet edits (keyed by domain + sample URL).
+	 *
+	 * @param string $domain Normalized domain.
+	 * @param string $url    Sample product URL.
+	 * @return string
+	 */
+	private function sheet_edits_key( $domain, $url ) {
+		return 'swi_sheet_' . md5( $domain . '|' . $url );
+	}
+
+	/**
+	 * Load persisted sheet edits for a domain + sample URL.
+	 *
+	 * @param string $domain Normalized domain.
+	 * @param string $url    Sample product URL.
+	 * @return array Array( 'sheet' => array, 'locked' => array ).
+	 */
+	private function get_sheet_edits( $domain, $url ) {
+		$value = get_option( $this->sheet_edits_key( $domain, $url ), array() );
+		if ( ! is_array( $value ) ) {
+			$value = array();
+		}
+		return array(
+			'sheet'  => isset( $value['sheet'] ) && is_array( $value['sheet'] ) ? $value['sheet'] : array(),
+			'locked' => isset( $value['locked'] ) && is_array( $value['locked'] ) ? $value['locked'] : array(),
+		);
+	}
+
+	/**
+	 * Persist sheet edits for a domain + sample URL.
+	 *
+	 * @param string $domain Normalized domain.
+	 * @param string $url    Sample product URL.
+	 * @param array  $sheet  The (edited) product sheet.
+	 * @param array  $locked Locked (correct) top-level field keys.
+	 */
+	private function save_sheet_edits( $domain, $url, $sheet, $locked ) {
+		update_option(
+			$this->sheet_edits_key( $domain, $url ),
+			array(
+				'sheet'  => is_array( $sheet ) ? $sheet : array(),
+				'locked' => is_array( $locked ) ? array_values( array_unique( array_map( 'strval', $locked ) ) ) : array(),
+			),
+			false
+		);
+	}
+
+	/**
+	 * Overlay the user's locked (correct) values onto a freshly-built sheet.
+	 *
+	 * Locked keys are top-level sheet fields; the persisted value wins so a
+	 * re-analyze or AI fix can't wipe out a manual correction.
+	 *
+	 * @param array $sheet  Freshly built product sheet.
+	 * @param array $edits  Persisted edits { sheet, locked }.
+	 * @return array
+	 */
+	private function apply_sheet_locks( $sheet, $edits ) {
+		if ( empty( $edits['locked'] ) || empty( $edits['sheet'] ) ) {
+			return $sheet;
+		}
+		foreach ( $edits['locked'] as $key ) {
+			if ( isset( $edits['sheet'][ $key ] ) && isset( $sheet[ $key ] ) ) {
+				$sheet[ $key ] = $edits['sheet'][ $key ];
+			}
+		}
+		return $sheet;
 	}
 
 	/**

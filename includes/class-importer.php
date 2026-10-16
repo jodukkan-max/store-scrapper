@@ -17,14 +17,15 @@ class SWI_Importer {
 	 *
 	 * @param array  $data       Scraped product data.
 	 * @param string $source_url Source product URL.
+	 * @param array  $options    Image options (white_bg, padding).
 	 * @return int Product ID.
 	 */
-	public static function import( $data, $source_url ) {
+	public static function import( $data, $source_url, $options = array() ) {
 		if ( 'variable' === $data['type'] && ! empty( $data['variants'] ) ) {
-			return self::import_variable( $data, $source_url );
+			return self::import_variable( $data, $source_url, $options );
 		}
 
-		return self::import_simple( $data, $source_url );
+		return self::import_simple( $data, $source_url, $options );
 	}
 
 	/**
@@ -49,19 +50,42 @@ class SWI_Importer {
 	}
 
 	/**
+	 * Resolve the product object to import into, replacing a type-mismatched
+	 * product so a re-import that changes simple↔variable doesn't orphan the
+	 * old product (which would keep holding its SKU and cause duplicate
+	 * products + dropped variant SKUs).
+	 *
+	 * @param int    $product_id Existing product ID (0 if none).
+	 * @param string $target_class Expected WC_Product class ('WC_Product_Simple'|'WC_Product_Variable').
+	 * @return WC_Product
+	 */
+	private static function prepare_product( $product_id, $target_class ) {
+		$product = $product_id ? wc_get_product( $product_id ) : false;
+
+		if ( $product && $product instanceof $target_class ) {
+			return $product; // Correct type — reuse (idempotent re-import).
+		}
+
+		if ( $product ) {
+			// Wrong type (e.g. first imported as simple, now scraped as
+			// variable). Force-delete the old product so its SKU and
+			// _swi_source_url are released and no duplicate is left behind.
+			$product->delete( true );
+		}
+
+		$class = 'WC_Product_Variable' === $target_class ? 'WC_Product_Variable' : 'WC_Product_Simple';
+		return new $class();
+	}
+
+	/**
 	 * Build or update a simple product.
 	 *
 	 * @param array  $data       Scraped product data.
 	 * @param string $source_url Source URL.
 	 * @return int
 	 */
-	private static function import_simple( $data, $source_url ) {
-		$product_id = self::find_existing( $source_url );
-		$product    = $product_id ? wc_get_product( $product_id ) : false;
-
-		if ( ! $product ) {
-			$product = new WC_Product_Simple();
-		}
+	private static function import_simple( $data, $source_url, $options = array() ) {
+		$product = self::prepare_product( self::find_existing( $source_url ), 'WC_Product_Simple' );
 
 		$product->set_name( self::clean_title( $data['title'] ) );
 		$product->set_description( wp_kses_post( $data['description'] ) );
@@ -93,7 +117,7 @@ class SWI_Importer {
 
 		$product_id = $product->save();
 
-		self::attach_images( $product_id, $data['images'] );
+		self::attach_images( $product_id, $data['images'], $options );
 
 		return $product_id;
 	}
@@ -105,13 +129,8 @@ class SWI_Importer {
 	 * @param string $source_url Source URL.
 	 * @return int
 	 */
-	private static function import_variable( $data, $source_url ) {
-		$product_id = self::find_existing( $source_url );
-		$product    = $product_id ? wc_get_product( $product_id ) : false;
-
-		if ( ! $product || ! $product instanceof WC_Product_Variable ) {
-			$product = new WC_Product_Variable();
-		}
+	private static function import_variable( $data, $source_url, $options = array() ) {
+		$product = self::prepare_product( self::find_existing( $source_url ), 'WC_Product_Variable' );
 
 		$product->set_name( self::clean_title( $data['title'] ) );
 		$product->set_description( wp_kses_post( $data['description'] ) );
@@ -148,10 +167,10 @@ class SWI_Importer {
 		// Create/update each variation.
 		$swatches = isset( $data['swatches'] ) && is_array( $data['swatches'] ) ? $data['swatches'] : array();
 		foreach ( $data['variants'] as $variant ) {
-			self::upsert_variation( $product_id, $variant, $swatches );
+			self::upsert_variation( $product_id, $variant, $swatches, $options );
 		}
 
-		self::attach_images( $product_id, $data['images'] );
+		self::attach_images( $product_id, $data['images'], $options );
 
 		return $product_id;
 	}
@@ -184,7 +203,7 @@ class SWI_Importer {
 	 * @param array $swatches  Swatch map (taxonomy => { name, ... }).
 	 * @return int Variation ID.
 	 */
-	private static function upsert_variation( $parent_id, $variant, $swatches = array() ) {
+	private static function upsert_variation( $parent_id, $variant, $swatches = array(), $options = array() ) {
 		$variation = null;
 		$sku       = ! empty( $variant['sku'] ) ? (string) $variant['sku'] : '';
 
@@ -206,20 +225,34 @@ class SWI_Importer {
 
 		// Map swatch human labels back to their global taxonomy, so variation
 		// attributes are keyed by taxonomy (pa_color) with the term slug.
-		$label_to_tax = array();
+		// Also build a term-name → term-slug map: global taxonomy variations
+		// must reference the term SLUG, not the human label (a label like
+		// "020N" must become "020n").
+		$label_to_tax  = array();
+		$value_to_slug = array();
 		foreach ( (array) $swatches as $taxonomy => $swatch ) {
 			if ( ! empty( $swatch['name'] ) ) {
 				$label_to_tax[ (string) $swatch['name'] ] = (string) $taxonomy;
+			}
+			foreach ( (array) $swatch['terms'] as $slug => $term ) {
+				$slug = (string) $slug;
+				$value_to_slug[ $slug ] = $slug;
+				if ( ! empty( $term['name'] ) ) {
+					$value_to_slug[ (string) $term['name'] ] = $slug;
+				}
 			}
 		}
 
 		$attributes = array();
 		foreach ( (array) $variant['attributes'] as $name => $value ) {
-			$name = (string) $name;
+			$name  = (string) $name;
+			$value = (string) $value;
 			if ( isset( $label_to_tax[ $name ] ) ) {
-				$attributes[ $label_to_tax[ $name ] ] = (string) $value; // Global taxonomy => term slug.
+				$tax = $label_to_tax[ $name ];
+				// Use the term slug when the value is a known term name/slug.
+				$attributes[ $tax ] = isset( $value_to_slug[ $value ] ) ? $value_to_slug[ $value ] : $value;
 			} else {
-				$attributes[ sanitize_title( $name ) ] = (string) $value; // Custom attribute.
+				$attributes[ sanitize_title( $name ) ] = $value; // Custom attribute.
 			}
 		}
 		$variation->set_attributes( $attributes );
@@ -263,7 +296,7 @@ class SWI_Importer {
 		// "Extra Variation Images" module swaps the gallery correctly when this
 		// variation is selected on the imported store.
 		if ( ! empty( $variant['image'] ) ) {
-			$attachment_id = self::sideload_image( $variant['image'], $parent_id );
+			$attachment_id = self::sideload_image( $variant['image'], $parent_id, $options );
 			if ( $attachment_id ) {
 				set_post_thumbnail( $variation_id, $attachment_id );
 				update_post_meta( $variation_id, 'rey_extra_variation_images', (string) $attachment_id );
@@ -406,35 +439,58 @@ class SWI_Importer {
 	 */
 	private static function ensure_global_attribute( $name, $type ) {
 		$taxonomy = wc_attribute_taxonomy_name( $name );
+		$args     = array(
+			'name'         => $name,
+			'slug'         => wc_sanitize_taxonomy_name( $name ),
+			'type'         => $type,
+			'order_by'     => 'menu_order',
+			'has_archives' => false,
+		);
+
+		// Persistent object caches (Redis) can serve a STALE attribute list, so
+		// wc_create_attribute wrongly reports "slug already in use" for an
+		// attribute that no longer exists in the DB. Clear that cache first.
+		self::flush_attribute_cache();
 
 		if ( taxonomy_exists( $taxonomy ) ) {
 			self::update_attribute_type( $taxonomy, $type );
 			return $taxonomy;
 		}
 
-		$id = wc_create_attribute(
-			array(
-				'name'         => $name,
-				'slug'         => wc_sanitize_taxonomy_name( $name ),
-				'type'         => $type,
-				'order_by'     => 'menu_order',
-				'has_archives' => false,
-			)
-		);
+		$id = wc_create_attribute( $args );
 
 		if ( is_wp_error( $id ) ) {
+			// Retry once after a full flush (the slug check may have read a
+			// stale list); then fall back to an existing registration.
+			self::flush_attribute_cache();
 			if ( taxonomy_exists( $taxonomy ) ) {
 				self::update_attribute_type( $taxonomy, $type );
 				return $taxonomy;
 			}
-			return '';
+			$id = wc_create_attribute( $args );
+			if ( is_wp_error( $id ) ) {
+				return ( taxonomy_exists( $taxonomy ) ? $taxonomy : '' );
+			}
 		}
 
 		delete_transient( 'wc_attribute_taxonomies' );
 		\WC_Cache_Helper::invalidate_cache_group( 'woocommerce-attributes' );
 		\WC_Post_Types::register_taxonomies();
+		self::flush_attribute_cache();
 
 		return $taxonomy;
+	}
+
+	/**
+	 * Invalidate the attribute/taxonomy/term object cache so a newly created
+	 * global attribute is immediately visible to wp_insert_term() even with a
+	 * persistent object cache (Redis).
+	 */
+	private static function flush_attribute_cache() {
+		delete_transient( 'wc_attribute_taxonomies' );
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_flush();
+		}
 	}
 
 	/**
@@ -604,8 +660,9 @@ class SWI_Importer {
 	 *
 	 * @param int   $product_id Product ID.
 	 * @param array $images     Image URLs.
+	 * @param array $options    Image options (white_bg, padding).
 	 */
-	private static function attach_images( $product_id, $images ) {
+	private static function attach_images( $product_id, $images, $options = array() ) {
 		$gallery = array();
 		$featured = 0;
 
@@ -615,7 +672,7 @@ class SWI_Importer {
 				continue;
 			}
 
-			$attachment_id = self::sideload_image( $url, $product_id );
+			$attachment_id = self::sideload_image( $url, $product_id, $options );
 			if ( ! $attachment_id ) {
 				continue;
 			}
@@ -641,13 +698,19 @@ class SWI_Importer {
 	 *
 	 * @param string $url       Image URL.
 	 * @param int    $parent_id Parent post ID.
+	 * @param array  $options   Image options (white_bg, padding).
 	 * @return int Attachment ID or 0.
 	 */
-	private static function sideload_image( $url, $parent_id ) {
+	private static function sideload_image( $url, $parent_id, $options = array() ) {
 		// Block private/internal image URLs (SSRF guard for scraped content).
 		if ( ! SWI_HTTP::is_url_allowed( $url ) ) {
 			return 0;
 		}
+
+		// Dedup key must include the processing signature, otherwise a
+		// previously-imported *unprocessed* copy of the same URL would be
+		// returned even when white-bg/padding are now requested.
+		$sig = self::image_signature( $options );
 
 		$existing = get_posts(
 			array(
@@ -655,13 +718,16 @@ class SWI_Importer {
 				'post_status'    => 'inherit',
 				'meta_key'       => '_swi_source_image',
 				'meta_value'     => $url,
-				'posts_per_page' => 1,
+				'posts_per_page' => 50,
 				'fields'         => 'ids',
 			)
 		);
 
-		if ( $existing ) {
-			return (int) $existing[0];
+		foreach ( (array) $existing as $candidate_id ) {
+			$candidate_sig = (string) get_post_meta( $candidate_id, '_swi_img_sig', true );
+			if ( $candidate_sig === $sig ) {
+				return (int) $candidate_id;
+			}
 		}
 
 		require_once ABSPATH . 'wp-admin/includes/media.php';
@@ -673,9 +739,18 @@ class SWI_Importer {
 			return 0;
 		}
 
+		// Optionally composite onto a white square canvas with padding.
+		$processed = self::process_image_file( $tmp, $options );
+
 		$name = basename( (string) wp_parse_url( $url, PHP_URL_PATH ) );
 		if ( '' === $name || '.' === $name ) {
 			$name = 'imported-image-' . time() . '.jpg';
+		}
+		// A processed image is always re-encoded to JPEG (flattened on white),
+		// so force a .jpg extension.
+		if ( $processed ) {
+			$info = pathinfo( $name );
+			$name = ( isset( $info['filename'] ) && '' !== $info['filename'] ? $info['filename'] : 'image' ) . '.jpg';
 		}
 
 		$file_array = array(
@@ -691,8 +766,123 @@ class SWI_Importer {
 		}
 
 		update_post_meta( $attachment_id, '_swi_source_image', $url );
+		update_post_meta( $attachment_id, '_swi_img_sig', $sig );
 
 		return $attachment_id;
+	}
+
+	/**
+	 * Derive a processing signature for the given image options ('' when no
+	 * processing). Used as a dedup key so processed + unprocessed copies of the
+	 * same source URL are distinct attachments.
+	 *
+	 * @param array $options Image options.
+	 * @return string
+	 */
+	private static function image_signature( $options ) {
+		$white_bg = isset( $options['white_bg'] ) ? (int) $options['white_bg'] : 0;
+		$padding  = isset( $options['padding'] ) ? (int) $options['padding'] : 0;
+
+		if ( $white_bg <= 0 ) {
+			return '';
+		}
+
+		return 'bg' . $white_bg . '_p' . $padding;
+	}
+
+	/**
+	 * Composite a downloaded image onto a white square canvas with optional
+	 * padding (aspect-ratio-preserving, centered). Re-encodes to JPEG.
+	 *
+	 * Returns true if the file was rewritten (the `$tmp` path now holds the
+	 * processed JPEG), false when no processing was requested or it failed.
+	 *
+	 * @param string $tmp     Path to the downloaded file (modified in place).
+	 * @param array  $options Image options.
+	 * @return bool
+	 */
+	private static function process_image_file( $tmp, $options ) {
+		$white_bg = isset( $options['white_bg'] ) ? (int) $options['white_bg'] : 0;
+		$padding  = isset( $options['padding'] ) ? (int) $options['padding'] : 0;
+
+		if ( $white_bg <= 0 || ! function_exists( 'imagecreatetruecolor' ) ) {
+			return false;
+		}
+
+		$src = self::gd_load( $tmp );
+		if ( ! $src ) {
+			return false;
+		}
+
+		$sw = imagesx( $src );
+		$sh = imagesy( $src );
+		if ( $sw <= 0 || $sh <= 0 ) {
+			imagedestroy( $src );
+			return false;
+		}
+
+		$canvas = imagecreatetruecolor( $white_bg, $white_bg );
+		$white  = imagecolorallocate( $canvas, 255, 255, 255 );
+		imagefilledrectangle( $canvas, 0, 0, $white_bg, $white_bg, $white );
+
+		// Inner bounds after padding.
+		$inner_w = max( 1, $white_bg - ( 2 * $padding ) );
+		$inner_h = max( 1, $white_bg - ( 2 * $padding ) );
+
+		// Fit source into the inner box, preserving aspect ratio.
+		$scale  = min( $inner_w / $sw, $inner_h / $sh );
+		$dst_w  = max( 1, (int) round( $sw * $scale ) );
+		$dst_h  = max( 1, (int) round( $sh * $scale ) );
+		$dst_x  = (int) round( ( $white_bg - $dst_w ) / 2 );
+		$dst_y  = (int) round( ( $white_bg - $dst_h ) / 2 );
+
+		imagecopyresampled( $canvas, $src, $dst_x, $dst_y, 0, 0, $dst_w, $dst_h, $sw, $sh );
+
+		// Re-encode to JPEG (flattens any transparency onto the white canvas).
+		imagejpeg( $canvas, $tmp, 90 );
+		imagedestroy( $canvas );
+		imagedestroy( $src );
+
+		return true;
+	}
+
+	/**
+	 * Load an image file into a GD resource, supporting jpg/png/gif/webp.
+	 *
+	 * @param string $path File path.
+	 * @return resource|false
+	 */
+	private static function gd_load( $path ) {
+		$mime = function_exists( 'mime_content_type' ) ? @mime_content_type( $path ) : '';
+		$mime = is_string( $mime ) ? $mime : '';
+
+		switch ( $mime ) {
+			case 'image/jpeg':
+			case 'image/jpg':
+				return @imagecreatefromjpeg( $path );
+			case 'image/png':
+				return @imagecreatefrompng( $path );
+			case 'image/gif':
+				return @imagecreatefromgif( $path );
+			case 'image/webp':
+				return function_exists( 'imagecreatefromwebp' ) ? @imagecreatefromwebp( $path ) : false;
+		}
+
+		// Fallback: try by extension.
+		$ext = strtolower( (string) pathinfo( $path, PATHINFO_EXTENSION ) );
+		switch ( $ext ) {
+			case 'jpg':
+			case 'jpeg':
+				return @imagecreatefromjpeg( $path );
+			case 'png':
+				return @imagecreatefrompng( $path );
+			case 'gif':
+				return @imagecreatefromgif( $path );
+			case 'webp':
+				return function_exists( 'imagecreatefromwebp' ) ? @imagecreatefromwebp( $path ) : false;
+		}
+
+		return false;
 	}
 
 	/**
@@ -764,12 +954,11 @@ class SWI_Importer {
 	/**
 	 * Resolve the post status for newly/updated imported products.
 	 *
-	 * Defaults to 'draft' (safer when bulk-scraping a catalog); admins can
-	 * opt into immediate publishing via the Settings toggle.
+	 * Products are always published.
 	 *
 	 * @return string
 	 */
 	private static function import_status() {
-		return (bool) (int) SWI_Plugin::get_option( 'auto_publish', 0 ) ? 'publish' : 'draft';
+		return 'publish';
 	}
 }

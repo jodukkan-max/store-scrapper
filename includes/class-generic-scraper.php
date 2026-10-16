@@ -88,23 +88,282 @@ class SWI_Generic_Scraper {
 			self::apply_variable( $doc, $xpath, $html, $profile['variable'], $data );
 		}
 
-		// Image fallback: if the profile's images rule yielded nothing (or the
-		// AI guessed a wrong selector), try known gallery containers so product
-		// images are still captured deterministically (PrestaShop/fotorama,
-		// Shopify, WooCommerce, generic swiper/owl carousels, etc.).
-		if ( empty( $data['images'] ) ) {
-			$data['images'] = self::fallback_images( $xpath );
+		// Deterministic enrichment (independent of the AI): normalize prices,
+		// fill any still-empty scalar fields from meta/JSON-LD, capture images
+		// from every known source, upgrade CDN image quality, and extract
+		// color/image swatches — so the AI's occasional miss is self-healed.
+		self::enrich_data( $doc, $xpath, $html, $url, $data );
+
+		return $data;
+	}
+
+	/**
+	 * Self-healing enrichment pass. Runs after the AI's profile extraction so
+	 * it only fills GAPS — a field the profile got right is never overwritten.
+	 *
+	 * Order:
+	 *   1. Normalize price strings (strip currency symbols/separators).
+	 *   2. Back-fill empty scalar fields (title, description, price, sku,
+	 *      currency, categories) from <meta> + JSON-LD + <h1>/<title>.
+	 *   3. Back-fill images from JSON-LD / og:image / srcset / embedded JSON /
+	 *      gallery containers, then upgrade CDN resolution.
+	 *   4. Extract color/image swatches (DOM + embedded JSON).
+	 *
+	 * @param DOMDocument $doc  Document.
+	 * @param DOMXPath    $xpath XPath instance.
+	 * @param string      $html Raw HTML.
+	 * @param string      $url  Base URL.
+	 * @param array       $data Data (by reference).
+	 */
+	private static function enrich_data( $doc, $xpath, $html, $url, &$data ) {
+		// 1. Normalize prices (also derives currency from the symbol).
+		$data['price']      = self::normalize_price( $data['price'], $data['currency'] );
+		$data['sale_price'] = self::normalize_price( $data['sale_price'], $data['currency'] );
+		foreach ( $data['variants'] as $i => $variant ) {
+			$data['variants'][ $i ]['price']      = self::normalize_price( $variant['price'], $data['currency'] );
+			$data['variants'][ $i ]['sale_price'] = self::normalize_price( $variant['sale_price'], $data['currency'] );
 		}
 
-		// Absolutize image URLs against the product URL.
-		$data['images'] = self::absolutize_images( $data['images'], $url );
-		foreach ( $data['variants'] as $i => $variant ) {
-			if ( ! empty( $variant['image'] ) ) {
-				$data['variants'][ $i ]['image'] = self::absolutize_url( $variant['image'], $url );
+		// 1b. Clean variant names (strip " - 5% Off", " - Out of Stock",
+		// "View All Options", …) and drop placeholder variants — regardless of
+		// which embedded JSON path the AI picked.
+		$data['variants'] = self::clean_variants( $data['variants'] );
+
+		// 1c. For variable products, reconcile the parent price: if it doesn't
+		// match any variant price (e.g. the AI grabbed a "from"/regular price),
+		// snap it to the minimum variant price.
+		self::reconcile_parent_price( $data );
+
+		// 2. Back-fill empty scalar fields.
+		self::enrich_scalars( $doc, $xpath, $data );
+
+		// 2b. Deterministic variant fallback: when the profile produced no
+		// variants (the AI often chases a hard __APOLLO_STATE__ / GraphQL path
+		// and misses the schema.org JSON-LD `offers` array), extract variants
+		// directly from the Product JSON-LD offers. Each offer = one variant.
+		if ( empty( $data['variants'] ) ) {
+			$fallback = self::variants_from_jsonld_offers( $xpath );
+			if ( ! empty( $fallback ) ) {
+				$data['variants'] = $fallback;
+				$data['type']     = 'variable';
 			}
 		}
 
-		return $data;
+		// 3. Images: multiple sources, then absolutize + upgrade CDN quality.
+		if ( empty( $data['images'] ) ) {
+			$data['images'] = self::enrich_images( $doc, $xpath, $html );
+		}
+		$data['images'] = self::absolutize_images( $data['images'], $url );
+		$data['images'] = array_map( array( __CLASS__, 'upgrade_image_url' ), $data['images'] );
+		foreach ( $data['variants'] as $i => $variant ) {
+			if ( ! empty( $variant['image'] ) ) {
+				$data['variants'][ $i ]['image'] = self::upgrade_image_url( self::absolutize_url( $variant['image'], $url ) );
+			}
+		}
+
+		// 4. Swatches.
+		if ( empty( $data['swatches'] ) ) {
+			$data['swatches'] = self::extract_swatches( $doc, $xpath, $data );
+		}
+	}
+
+	/**
+	 * Clean every variant: strip promo/stock suffixes from attribute values and
+	 * drop placeholder variants ("View All Options", "Select …").
+	 *
+	 * @param array $variants Normalized variants.
+	 * @return array
+	 */
+	private static function clean_variants( $variants ) {
+		$out = array();
+		foreach ( (array) $variants as $variant ) {
+			if ( ! is_array( $variant ) ) {
+				continue;
+			}
+
+			$attrs = array();
+			$empty = true;
+			foreach ( (array) $variant['attributes'] as $name => $value ) {
+				$clean = self::clean_variant_name( $value );
+				if ( '' === $clean ) {
+					continue; // placeholder value ("View All Options", etc.).
+				}
+				$attrs[ $name ] = $clean;
+				$empty          = false;
+			}
+
+			// Drop the variant entirely if it has no real attribute values.
+			if ( $empty && empty( $variant['sku'] ) ) {
+				continue;
+			}
+
+			$variant['attributes'] = $attrs;
+			$out[]                 = $variant;
+		}
+
+		return $out;
+	}
+
+	/**
+	 * For variable products, if the parent price doesn't match any variant
+	 * price, snap it to the minimum variant price (the WooCommerce convention
+	 * and the value the storefront displays as "from $X").
+	 *
+	 * @param array $data Data (by reference).
+	 */
+	private static function reconcile_parent_price( &$data ) {
+		if ( 'variable' !== $data['type'] || empty( $data['variants'] ) ) {
+			return;
+		}
+
+		$prices = array();
+		foreach ( $data['variants'] as $v ) {
+			$p = self::to_float_raw( isset( $v['price'] ) ? $v['price'] : '' );
+			if ( $p > 0 ) {
+				$prices[] = $p;
+			}
+		}
+		if ( empty( $prices ) ) {
+			return;
+		}
+
+		$parent = self::to_float_raw( $data['price'] );
+		$min    = min( $prices );
+
+		// Snap when empty, or when it matches no variant (within 1 cent).
+		$matches = false;
+		foreach ( $prices as $p ) {
+			if ( abs( $p - $parent ) < 0.01 ) {
+				$matches = true;
+				break;
+			}
+		}
+
+		if ( $parent <= 0 || ! $matches ) {
+			$data['price'] = (string) $min;
+		}
+	}
+
+	/**
+	 * Parse a price string to a float (handles symbols + separators), reusing
+	 * the same logic as the importer without needing a WC_Product.
+	 *
+	 * @param string $value Price string.
+	 * @return float
+	 */
+	private static function to_float_raw( $value ) {
+		$s = preg_replace( '/[^0-9.,\-]/', '', (string) $value );
+		if ( '' === $s ) {
+			return 0.0;
+		}
+		$last_comma = strrpos( $s, ',' );
+		$last_dot   = strrpos( $s, '.' );
+		if ( false !== $last_comma && false !== $last_dot ) {
+			if ( $last_comma > $last_dot ) {
+				$s = str_replace( '.', '', $s );
+				$s = str_replace( ',', '.', $s );
+			} else {
+				$s = str_replace( ',', '', $s );
+			}
+		} elseif ( false !== $last_comma && false === $last_dot ) {
+			$parts = explode( ',', $s );
+			$after = end( $parts );
+			$s     = ( count( $parts ) > 1 && 3 === strlen( $after ) ) ? str_replace( ',', '', $s ) : str_replace( ',', '.', $s );
+		}
+		return (float) $s;
+	}
+
+	/**
+	 * Deterministic variant extraction from schema.org JSON-LD `offers` arrays.
+	 *
+	 * Many stores (Notino, headless/Magento) put the variants in a Product
+	 * JSON-LD node whose `offers` array holds one Offer per variation (name,
+	 * price, sku, image, url). This is the reliable source the AI sometimes
+	 * misses when it chases a GraphQL `__APOLLO_STATE__` path instead.
+	 *
+	 * @param DOMXPath $xpath XPath instance.
+	 * @return array Normalized variants.
+	 */
+	private static function variants_from_jsonld_offers( $xpath ) {
+		$parent_name = '';
+
+		foreach ( self::flatten_jsonld( $xpath ) as $node ) {
+			$type = isset( $node['@type'] ) ? (array) $node['@type'] : array();
+			if ( ! in_array( 'Product', $type, true ) || empty( $node['offers'] ) ) {
+				continue;
+			}
+
+			if ( '' === $parent_name && ! empty( $node['name'] ) ) {
+				$parent_name = trim( (string) $node['name'] );
+			}
+
+			$offers = isset( $node['offers'][0] ) ? $node['offers'] : array( $node['offers'] );
+			if ( count( $offers ) < 2 ) {
+				continue; // simple product.
+			}
+
+			$variants = array();
+			foreach ( $offers as $offer ) {
+				if ( ! is_array( $offer ) ) {
+					continue;
+				}
+
+				$offer_name = isset( $offer['name'] ) ? (string) $offer['name'] : '';
+				$attr       = self::parse_offer_attribute( $parent_name, $offer_name );
+				if ( '' === $attr['value'] ) {
+					continue;
+				}
+
+				$variants[] = array(
+					'attributes' => array( $attr['label'] => $attr['value'] ),
+					'price'      => isset( $offer['price'] ) ? (string) $offer['price'] : '',
+					'sale_price' => '',
+					'sku'        => isset( $offer['sku'] ) ? (string) $offer['sku'] : '',
+					'image'      => isset( $offer['image'] ) ? (string) $offer['image'] : '',
+					'stock'      => null,
+				);
+			}
+
+			if ( count( $variants ) >= 2 ) {
+				return $variants;
+			}
+		}
+
+		return array();
+	}
+
+	/**
+	 * Parse an offer name into an attribute {label, value}.
+	 *
+	 * "Bielenda GLAZE & GLOW shade 02 30 g" → label "Shade", value "02".
+	 * Strips the parent product-name prefix, a leading descriptor word
+	 * (shade/color/…), and a trailing volume ("30 g").
+	 *
+	 * @param string $parent_name Parent product name.
+	 * @param string $offer_name  Offer name.
+	 * @return array {label, value}.
+	 */
+	private static function parse_offer_attribute( $parent_name, $offer_name ) {
+		$rest = trim( (string) $offer_name );
+		if ( '' !== (string) $parent_name && 0 === stripos( $rest, (string) $parent_name ) ) {
+			$rest = trim( (string) substr( $rest, strlen( (string) $parent_name ) ) );
+		}
+
+		$label = 'Shade';
+		$value = $rest;
+
+		if ( preg_match( '/^(shade|shades|color|colour|colors|colours|scent|fragrance|flavor|flavour|tone|finish)\b[\s:\-\x{00A0}]*/iu', $value, $dm ) ) {
+			$label = ucfirst( strtolower( $dm[1] ) );
+			$value = trim( (string) preg_replace( '/^(shade|shades|color|colour|colors|colours|scent|fragrance|flavor|flavour|tone|finish)\b[\s:\-\x{00A0}]*/iu', '', $value ) );
+		}
+
+		// Drop a trailing volume/size ("30 g", "200 ml") — NBSP-safe.
+		$value = trim( (string) preg_replace( '/[\s\x{00A0}]*\d+(?:[.,]\d+)?[\s\x{00A0}]*(ml|g|mg|l|kg|oz|cl)[\s\x{00A0}]*$/iu', '', $value ) );
+
+		return array(
+			'label' => $label,
+			'value' => $value,
+		);
 	}
 
 	/**
@@ -228,6 +487,27 @@ class SWI_Generic_Scraper {
 					// JSON-LD embedded in HTML often double-encodes entities.
 					return html_entity_decode( html_entity_decode( $value, ENT_QUOTES, 'UTF-8' ), ENT_QUOTES, 'UTF-8' );
 				}
+			} elseif ( is_array( $value ) ) {
+				// List result (e.g. Product.image = [url, url, ...]). Flatten
+				// to a string list so the images/categories field keeps the
+				// whole array instead of being dropped (extract_jsonld only
+				// returned scalars before, collapsing a 10-image gallery to 1).
+				$list = array();
+				foreach ( $value as $entry ) {
+					if ( is_scalar( $entry ) ) {
+						$entry = trim( (string) $entry );
+						if ( '' !== $entry ) {
+							$list[] = html_entity_decode( html_entity_decode( $entry, ENT_QUOTES, 'UTF-8' ), ENT_QUOTES, 'UTF-8' );
+						}
+					} elseif ( is_array( $entry ) && ! empty( $entry['url'] ) ) {
+						$list[] = (string) $entry['url'];
+					} elseif ( is_array( $entry ) && ! empty( $entry['@id'] ) ) {
+						$list[] = (string) $entry['@id'];
+					}
+				}
+				if ( ! empty( $list ) ) {
+					return $list;
+				}
 			}
 		}
 
@@ -278,8 +558,12 @@ class SWI_Generic_Scraper {
 
 		foreach ( $candidates as $source ) {
 			$values = self::dot_walk_all( $source, $tokens );
-			$values = array_values( array_filter( array_map( 'strval', $values ), function ( $v ) {
-				return '' !== trim( $v );
+			// Drop generic breadcrumb "home"/"shop" links so they don't end up
+			// as product categories.
+			$home_labels = array( 'home', 'home page', 'shop', 'back to products' );
+			$values      = array_values( array_filter( array_map( 'strval', $values ), function ( $v ) use ( $home_labels ) {
+				$v = trim( $v );
+				return '' !== $v && ! in_array( strtolower( $v ), $home_labels, true );
 			} ) );
 			if ( ! empty( $values ) ) {
 				return array_map(
@@ -301,7 +585,12 @@ class SWI_Generic_Scraper {
 	 * @return array
 	 */
 	private static function tokenize_path( $path ) {
-		preg_match_all( '/\.?([^.\[\]]+)|\[(\d+)\]/', (string) $path, $m, PREG_SET_ORDER );
+		$path = (string) $path;
+		// Accept a JSONPath-style root prefix so the AI can emit "$.offers"
+		// (or "$.itemListElement.name") without the "$" being treated as a
+		// literal key. "$" alone and "$." both mean "the root".
+		$path = preg_replace( '/^\$\.?/', '', trim( $path ) );
+		preg_match_all( '/\.?([^.\[\]]+)|\[(\d+)\]/', $path, $m, PREG_SET_ORDER );
 		$tokens = array();
 		foreach ( $m as $t ) {
 			if ( isset( $t[1] ) && '' !== $t[1] ) {
@@ -375,6 +664,129 @@ class SWI_Generic_Scraper {
 		}
 
 		return $out;
+	}
+
+	/**
+	 * Whether a schema.org `Product` node has an `offers` array of at least
+	 * `$min` entries (i.e. a variable product where each offer is a variant).
+	 *
+	 * @param DOMXPath $xpath XPath instance.
+	 * @param int      $min   Minimum offers count to count as variable.
+	 * @return bool
+	 */
+	private static function jsonld_has_offers_array( $xpath, $min = 2 ) {
+		foreach ( self::flatten_jsonld( $xpath ) as $node ) {
+			$type = isset( $node['@type'] ) ? (array) $node['@type'] : array();
+			if ( ! in_array( 'Product', $type, true ) ) {
+				continue;
+			}
+			if ( isset( $node['offers'] ) && is_array( $node['offers'] ) ) {
+				$offers = isset( $node['offers'][0] ) ? $node['offers'] : array( $node['offers'] );
+				if ( count( $offers ) >= $min ) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Produce a compact "source inventory" of an HTML document: which structured
+	 * data sources exist (JSON-LD nodes, meta tags, embedded JSON/state, DOM
+	 * variant signals). This is the "map" the AI agent is given so it picks the
+	 * right extraction strategy instead of guessing — e.g. chasing a GraphQL
+	 * __APOLLO_STATE__ cache when a schema.org `offers` array is available.
+	 *
+	 * @param string $html Raw HTML.
+	 * @return string Human-readable inventory.
+	 */
+	public static function source_inventory( $html ) {
+		$lines = array();
+		$doc   = self::load_dom( $html );
+		if ( is_wp_error( $doc ) ) {
+			return '';
+		}
+		$xpath = new DOMXPath( $doc );
+
+		$jsonld = self::flatten_jsonld( $xpath );
+		if ( ! empty( $jsonld ) ) {
+			$lines[] = '=== JSON-LD (schema.org) — most reliable source ===';
+			$i       = 0;
+			foreach ( $jsonld as $node ) {
+				$i++;
+				$type = isset( $node['@type'] ) ? ( is_array( $node['@type'] ) ? implode( ',', $node['@type'] ) : (string) $node['@type'] ) : '?';
+				$s    = '  #' . $i . ' @type=' . $type;
+				if ( ! empty( $node['name'] ) ) {
+					$s .= ' | name=' . mb_substr( (string) $node['name'], 0, 60 );
+				}
+				if ( 'Product' === $type || 'ProductGroup' === $type ) {
+					$offers = isset( $node['offers'] ) && is_array( $node['offers'] ) ? ( isset( $node['offers'][0] ) ? count( $node['offers'] ) : 1 ) : 0;
+					$hv     = isset( $node['hasVariant'] ) && is_array( $node['hasVariant'] ) ? ( isset( $node['hasVariant'][0] ) ? count( $node['hasVariant'] ) : 1 ) : 0;
+					$s     .= ' | offers=' . $offers . ' | hasVariant=' . $hv;
+					if ( $offers > 1 ) {
+						$s .= '  <-- VARIABLE: each offer is one variant';
+					}
+				}
+				$lines[] = $s;
+			}
+		}
+
+		// Meta tags of interest.
+		$meta = array();
+		if ( preg_match_all( '/<meta[^>]*>/i', $html, $mm ) ) {
+			foreach ( $mm[0] as $tag ) {
+				$key = preg_match( '/(?:property|name)=["\']([^"\']+)["\']/i', $tag, $k ) ? $k[1] : '';
+				$val = preg_match( '/content=["\']([^"\']*)["\']/i', $tag, $v ) ? $v[1] : '';
+				if ( '' === $key || '' === $val ) {
+					continue;
+				}
+				$lk = strtolower( $key );
+				if ( false !== strpos( $lk, 'title' ) || false !== strpos( $lk, 'image' ) || false !== strpos( $lk, 'description' ) || false !== strpos( $lk, 'price' ) || false !== strpos( $lk, 'currency' ) || false !== strpos( $lk, 'brand' ) || false !== strpos( $lk, 'sku' ) ) {
+					$meta[] = '  ' . $key . ' = ' . mb_substr( $val, 0, 120 );
+				}
+			}
+		}
+		if ( ! empty( $meta ) ) {
+			$lines[] = '=== <meta> tags ===';
+			$lines   = array_merge( $lines, array_slice( $meta, 0, 24 ) );
+		}
+
+		// Embedded JSON / client state.
+		$embedded = array();
+		if ( false !== strpos( $html, '__APOLLO_STATE__' ) ) {
+			$embedded[] = '  - __APOLLO_STATE__ (GraphQL client cache — variants are __ref pointers, NOT directly readable; prefer the JSON-LD offers array instead)';
+		}
+		if ( false !== strpos( $html, '__NEXT_DATA__' ) ) {
+			$embedded[] = '  - __NEXT_DATA__ (Next.js page props — may hold product/variant data under props.pageProps)';
+		}
+		if ( preg_match( '/<script[^>]*type=["\']application\/json["\']/i', $html ) ) {
+			$embedded[] = '  - application/json script block(s)';
+		}
+		if ( preg_match( '/data-props=|data-product=|data-variants=/i', $html ) ) {
+			$embedded[] = '  - data-props / data-product / data-variants attributes';
+		}
+		if ( ! empty( $embedded ) ) {
+			$lines[] = '=== Embedded JSON / client state ===';
+			$lines   = array_merge( $lines, $embedded );
+		}
+
+		// DOM signals.
+		$dom = array();
+		if ( preg_match( '/<select[\s>]/i', $html ) ) {
+			$dom[] = '  - <select> element(s) present (check for variant dropdowns)';
+		}
+		$imgs    = preg_match_all( '/<img[\s>]/i', $html );
+		$srcsets = preg_match_all( '/srcset=/i', $html );
+		if ( $imgs ) {
+			$dom[] = '  - ' . $imgs . ' <img> tags (' . $srcsets . ' with srcset)';
+		}
+		if ( ! empty( $dom ) ) {
+			$lines[] = '=== DOM signals ===';
+			$lines   = array_merge( $lines, $dom );
+		}
+
+		return implode( "\n", $lines );
 	}
 
 	/**
@@ -661,7 +1073,11 @@ class SWI_Generic_Scraper {
 		if ( ! empty( $detection ) ) {
 			$strategy = isset( $detection['strategy'] ) ? (string) $detection['strategy'] : '';
 
-			if ( 'selector' === $strategy && ! empty( $detection['selector'] ) ) {
+			if ( 'jsonld_offers' === $strategy ) {
+				// schema.org Product with an `offers` array of >1 (each offer
+				// is a variant). Robust — no fragile CSS selector needed.
+				$is_var = self::jsonld_has_offers_array( $xpath, 2 );
+			} elseif ( 'selector' === $strategy && ! empty( $detection['selector'] ) ) {
 				// Presence check: the selector matches at least one node.
 				$found = $xpath->query( self::css_to_xpath( $detection['selector'] ) );
 				$is_var = ( $found && $found->length > 0 );
@@ -871,6 +1287,46 @@ class SWI_Generic_Scraper {
 	}
 
 	/**
+	 * Strip promotional / stock / placeholder suffixes from a variant name.
+	 *
+	 * "112 American Woman - 5% Off - Out of Stock" → "112 American Woman".
+	 * Returns '' for placeholder labels ("View All Options", "Select …") that
+	 * aren't real variants.
+	 *
+	 * @param string $name Raw variant/option name.
+	 * @return string Cleaned name ('' when it's a placeholder).
+	 */
+	private static function clean_variant_name( $name ) {
+		$name = trim( (string) $name );
+		if ( '' === $name ) {
+			return '';
+		}
+
+		// Placeholder labels — not real variants.
+		if ( preg_match( '/^(view all options?|select an? option|choose an? option|select size|select color|select shade|please select|choose)\b/i', $name ) ) {
+			return '';
+		}
+
+		// Split on " - " and drop promotional/stock segments.
+		$parts = preg_split( '/\s*-\s*/', $name );
+		$kept  = array();
+		foreach ( $parts as $part ) {
+			if ( preg_match( '/^\d+(?:[.,]\d+)?\s*%\s*(?:off|sale)?$/i', $part ) ) {
+				continue; // "5% Off", "25%"
+			}
+			if ( preg_match( '/^(out\s*of\s*stock|sold\s*out|back\s*order(?:ed)?|backorder)$/i', $part ) ) {
+				continue; // "Out of Stock", "Sold out"
+			}
+			if ( preg_match( '/^(off|sale|new|best\s*seller|clearance)$/i', $part ) ) {
+				continue; // "Off", "Sale"
+			}
+			$kept[] = $part;
+		}
+
+		return trim( implode( ' - ', $kept ) );
+	}
+
+	/**
 	 * Extract variants from an embedded JSON blob (script or attribute).
 	 *
 	 * @param DOMXPath $xpath    XPath instance.
@@ -925,6 +1381,7 @@ class SWI_Generic_Scraper {
 			}
 
 			$attrs = array();
+			$skip  = false;
 			if ( 'attributes_map' === $attr_mode ) {
 				// WooCommerce-style: each item has attributes => { "attribute_pa_color": "slug" }.
 				$map = isset( $item['attributes'] ) && is_array( $item['attributes'] ) ? $item['attributes'] : array();
@@ -941,6 +1398,64 @@ class SWI_Generic_Scraper {
 				foreach ( explode( ' / ', $title ) as $i => $part ) {
 					$name             = isset( $names[ $i ] ) ? (string) $names[ $i ] : ( 'Option ' . ( $i + 1 ) );
 					$attrs[ $name ]   = trim( $part );
+				}
+			} elseif ( 'name_attr' === $attr_mode ) {
+				// schema.org `offers` arrays (Notino & similar): each offer is a
+				// variant distinguished by its `name`, e.g. "DIOR Sauvage 200 ml"
+				// or "Avène Sun … shade Sable - Beige 10 g".
+				$parent_name = isset( $decoded['name'] ) ? (string) $decoded['name'] : '';
+				$title       = isset( $item['name'] ) ? (string) $item['name'] : ( isset( $item['title'] ) ? (string) $item['title'] : '' );
+				$rest        = trim( $title );
+				if ( '' !== $parent_name && 0 === stripos( $rest, $parent_name ) ) {
+					$rest = trim( (string) substr( $rest, strlen( $parent_name ) ) );
+				}
+
+				$label = isset( $names[0] ) && '' !== (string) $names[0] ? (string) $names[0] : 'Option';
+
+				// When the AI supplied an explicit `attribute_regex`, use its
+				// capture group directly on the offer name (allows arbitrary
+				// per-site transforms, e.g. keeping "10 g" in the shade name).
+				if ( ! empty( $variants['attribute_regex'] ) ) {
+					$pattern = (string) $variants['attribute_regex'];
+					// LLMs often double-escape JSON regex ("shade\\\\s+") — the
+					// JSON already decoded to a single backslash; collapse any
+					// doubled backslashes so \s matches whitespace.
+					$pattern = str_replace( '\\\\', '\\', $pattern );
+					$value   = '';
+					if ( false !== @preg_match( $pattern, $title, $m ) ) {
+						$value = isset( $m[1] ) ? trim( (string) $m[1] ) : trim( (string) $m[0] );
+					}
+					if ( '' === $value ) {
+						// Fallback: strip the parent name and a leading
+						// "shade/color/…" descriptor word.
+						$value = '' !== $rest ? $rest : $title;
+						$value = trim( (string) preg_replace( '/^(shade|shades|color|colour|colors|colours|scent|fragrance|flavor|flavour|tone|finish)\b[\s:\-\x{00A0}]*/iu', '', $value ) );
+					}
+					$attrs[ $label ] = $value;
+					// Fall through to price/sku/image extraction below.
+				} else {
+					// Built-in heuristic (no regex supplied).
+					$value = '' !== $rest ? $rest : $title;
+
+					if ( preg_match( '/^(shade|shades|color|colour|colors|colours|scent|fragrance|flavor|flavour|tone|finish)\b/u', $value, $dm ) ) {
+						// Descriptor-led: "<shade> <value> [<volume>]".
+						$label = isset( $names[0] ) && '' !== (string) $names[0] ? (string) $names[0] : ucfirst( strtolower( $dm[1] ) );
+						$value = trim( (string) preg_replace( '/^(shade|shades|color|colour|colors|colours|scent|fragrance|flavor|flavour|tone|finish)\b[\s:\-\x{00A0}]*/iu', '', $value ) );
+						// Drop a trailing volume/size ("10 g", "200 ml") — NBSP-safe.
+						$value = trim( (string) preg_replace( '/[\s\x{00A0}]*\d+(?:[.,]\d+)?[\s\x{00A0}]*(ml|g|mg|l|kg|oz|cl)[\s\x{00A0}]*$/iu', '', $value ) );
+					} elseif ( preg_match( '/^\d+(?:[.,]\d+)?[\s\x{00A0}]*(ml|g|mg|l|kg|oz|cl)$/iu', $value ) ) {
+						// Pure volume/size: "200 ml", "10 g".
+						$label = 'Size';
+					}
+
+					// Strip promo/stock/placeholder suffixes (" - 5% Off",
+					// " - Out of Stock", "View All Options", …).
+					$value = self::clean_variant_name( $value );
+					if ( '' === $value ) {
+						$skip = true; // placeholder ("View All Options", etc.).
+					} else {
+						$attrs[ $label ] = $value;
+					}
 				}
 			} else {
 				// option_fields mode. If "option_paths" is provided, each name
@@ -998,6 +1513,10 @@ class SWI_Generic_Scraper {
 						$stock = 0;
 					}
 				}
+			}
+
+			if ( $skip ) {
+				continue; // placeholder option ("View All Options", etc.).
 			}
 
 			$out[] = array(
@@ -1144,6 +1663,703 @@ class SWI_Generic_Scraper {
 		}
 
 		return array();
+	}
+
+	/**
+	 * Normalize a price string to a bare number ("$39.18" → "39.18"),
+	 * stripping currency symbols/letters and normalizing separators. Also
+	 * fills $currency (by reference) when the price carried a symbol.
+	 *
+	 * @param string $price    Raw price.
+	 * @param string $currency Currency (by reference).
+	 * @return string
+	 */
+	private static function normalize_price( $price, &$currency ) {
+		$raw = trim( (string) $price );
+		if ( '' === $raw ) {
+			return '';
+		}
+
+		// Derive currency from a leading symbol.
+		$symbol_map = array(
+			'$'    => 'USD',
+			'US$'  => 'USD',
+			'USD'  => 'USD',
+			'€'    => 'EUR',
+			'EUR'  => 'EUR',
+			'£'    => 'GBP',
+			'GBP'  => 'GBP',
+			'AED'  => 'AED',
+			'SAR'  => 'SAR',
+			'JOD'  => 'JOD',
+			'EGP'  => 'EGP',
+			'KWD'  => 'KWD',
+			'QAR'  => 'QAR',
+		);
+		foreach ( $symbol_map as $sym => $code ) {
+			if ( 0 === stripos( $raw, $sym ) || false !== stripos( $raw, ' ' . $sym ) ) {
+				if ( '' === (string) $currency ) {
+					$currency = $code;
+				}
+				break;
+			}
+		}
+
+		// Keep only digits, dot, comma and a leading minus.
+		$s = preg_replace( '/[^0-9.,\-]/', '', $raw );
+		if ( '' === $s ) {
+			return '';
+		}
+
+		$last_comma = strrpos( $s, ',' );
+		$last_dot   = strrpos( $s, '.' );
+
+		if ( false !== $last_comma && false !== $last_dot ) {
+			// Both present: rightmost is the decimal separator.
+			if ( $last_comma > $last_dot ) {
+				// "1.299,99" — dots are thousands, comma is decimal.
+				$s = str_replace( '.', '', $s );
+				$s = str_replace( ',', '.', $s );
+			} else {
+				// "1,299.99" — commas are thousands.
+				$s = str_replace( ',', '', $s );
+			}
+		} elseif ( false !== $last_comma && false === $last_dot ) {
+			$parts = explode( ',', $s );
+			$after = end( $parts );
+			if ( count( $parts ) > 1 && 3 === strlen( $after ) ) {
+				$s = str_replace( ',', '', $s );
+			} else {
+				$s = str_replace( ',', '.', $s );
+			}
+		}
+
+		return (string) $s;
+	}
+
+	/**
+	 * Read a <meta> value by property= then name=.
+	 *
+	 * @param DOMXPath $xpath XPath instance.
+	 * @param string   $key   Meta key.
+	 * @return string
+	 */
+	private static function meta_value( $xpath, $key ) {
+		$node = $xpath->query( '//meta[@property="' . $key . '"]' )->item( 0 );
+		if ( ! $node ) {
+			$node = $xpath->query( '//meta[@name="' . $key . '"]' )->item( 0 );
+		}
+		return $node ? trim( $node->getAttribute( 'content' ) ) : '';
+	}
+
+	/**
+	 * Back-fill still-empty scalar fields from meta tags, JSON-LD and DOM.
+	 * Never overwrites a value the profile already extracted.
+	 *
+	 * @param DOMDocument $doc  Document.
+	 * @param DOMXPath    $xpath XPath instance.
+	 * @param array       $data Data (by reference).
+	 */
+	private static function enrich_scalars( $doc, $xpath, &$data ) {
+		// Title.
+		if ( '' === trim( (string) $data['title'] ) ) {
+			$t = self::meta_value( $xpath, 'og:title' );
+			if ( '' === $t ) {
+				$n = $xpath->query( '//h1' )->item( 0 );
+				$t = $n ? trim( $n->textContent ) : '';
+			}
+			if ( '' === $t ) {
+				$n = $xpath->query( '//title' )->item( 0 );
+				$t = $n ? trim( $n->textContent ) : '';
+			}
+			$data['title'] = $t;
+		}
+
+		// Short description.
+		if ( '' === trim( (string) $data['short_description'] ) ) {
+			$data['short_description'] = self::meta_value( $xpath, 'og:description' );
+		}
+
+		// Description (fall back to og:description when missing).
+		if ( '' === trim( (string) $data['description'] ) ) {
+			$data['description'] = self::meta_value( $xpath, 'description' );
+			if ( '' === $data['description'] ) {
+				$data['description'] = self::meta_value( $xpath, 'og:description' );
+			}
+		}
+
+		// Price / currency from meta + JSON-LD.
+		if ( '' === trim( (string) $data['price'] ) ) {
+			$p = self::meta_value( $xpath, 'product:price:amount' );
+			if ( '' === $p ) {
+				$p = self::meta_value( $xpath, 'og:price:amount' );
+			}
+			$data['price'] = $p;
+		}
+		if ( '' === trim( (string) $data['currency'] ) ) {
+			$data['currency'] = self::meta_value( $xpath, 'product:price:currency' );
+			if ( '' === $data['currency'] ) {
+				$data['currency'] = self::meta_value( $xpath, 'og:price:currency' );
+			}
+		}
+
+		// SKU / description / price / images from schema.org JSON-LD.
+		foreach ( self::flatten_jsonld( $xpath ) as $node ) {
+			$type = isset( $node['@type'] ) ? (array) $node['@type'] : array();
+			if ( ! in_array( 'Product', $type, true ) ) {
+				continue;
+			}
+			if ( '' === trim( (string) $data['sku'] ) ) {
+				if ( ! empty( $node['sku'] ) ) {
+					$data['sku'] = (string) $node['sku'];
+				} elseif ( ! empty( $node['mpn'] ) ) {
+					$data['sku'] = (string) $node['mpn'];
+				} elseif ( ! empty( $node['gtin13'] ) ) {
+					$data['sku'] = (string) $node['gtin13'];
+				}
+			}
+			if ( '' === trim( (string) $data['description'] ) && ! empty( $node['description'] ) ) {
+				$data['description'] = (string) $node['description'];
+			}
+			if ( '' === trim( (string) $data['price'] ) && ! empty( $node['offers'] ) ) {
+				$offers = isset( $node['offers'][0] ) ? $node['offers'] : array( $node['offers'] );
+				if ( isset( $offers[0]['price'] ) ) {
+					$data['price'] = (string) $offers[0]['price'];
+				}
+				if ( '' === trim( (string) $data['currency'] ) && isset( $offers[0]['priceCurrency'] ) ) {
+					$data['currency'] = (string) $offers[0]['priceCurrency'];
+				}
+			}
+			break; // first Product node only.
+		}
+
+		// Categories from BreadcrumbList JSON-LD when still empty.
+		if ( empty( $data['categories'] ) ) {
+			foreach ( self::flatten_jsonld( $xpath ) as $node ) {
+				$type = isset( $node['@type'] ) ? (array) $node['@type'] : array();
+				if ( ! in_array( 'BreadcrumbList', $type, true ) || empty( $node['itemListElement'] ) ) {
+					continue;
+				}
+				$cats = array();
+				foreach ( $node['itemListElement'] as $item ) {
+					$name = '';
+					if ( isset( $item['name'] ) && is_scalar( $item['name'] ) ) {
+						$name = (string) $item['name'];
+					} elseif ( isset( $item['item']['name'] ) && is_scalar( $item['item']['name'] ) ) {
+						$name = (string) $item['item']['name'];
+					}
+					$name = trim( $name );
+					if ( '' !== $name && ! in_array( strtolower( $name ), array( 'home', 'home page', 'shop', 'back to products' ), true ) ) {
+						$cats[] = $name;
+					}
+				}
+				if ( ! empty( $cats ) ) {
+					$data['categories'] = $cats;
+				}
+				break;
+			}
+		}
+	}
+
+	/**
+	 * Collect images from every known source: JSON-LD, OpenGraph meta,
+	 * <img srcset>, embedded JSON, and gallery containers.
+	 *
+	 * @param DOMDocument $doc  Document.
+	 * @param DOMXPath    $xpath XPath instance.
+	 * @param string      $html Raw HTML.
+	 * @return array
+	 */
+	private static function enrich_images( $doc, $xpath, $html ) {
+		$images = array();
+
+		// 1. schema.org JSON-LD Product.image.
+		foreach ( self::flatten_jsonld( $xpath ) as $node ) {
+			$type = isset( $node['@type'] ) ? (array) $node['@type'] : array();
+			if ( ! in_array( 'Product', $type, true ) || empty( $node['image'] ) ) {
+				continue;
+			}
+			$imgs = is_array( $node['image'] ) ? $node['image'] : array( $node['image'] );
+			foreach ( $imgs as $img ) {
+				if ( is_string( $img ) ) {
+					$images[] = $img;
+				} elseif ( is_array( $img ) && ! empty( $img['url'] ) ) {
+					$images[] = (string) $img['url'];
+				}
+			}
+			if ( ! empty( $images ) ) {
+				break;
+			}
+		}
+
+		// 2. OpenGraph / twitter image.
+		if ( empty( $images ) ) {
+			foreach ( array( 'og:image', 'og:image:secure_url', 'twitter:image' ) as $k ) {
+				$v = self::meta_value( $xpath, $k );
+				if ( '' !== $v ) {
+					$images[] = $v;
+				}
+			}
+		}
+
+		// 3. <img srcset> — pick the largest candidate.
+		if ( empty( $images ) ) {
+			foreach ( $xpath->query( '//img[@srcset]' ) as $img ) {
+				$srcset = $img->getAttribute( 'srcset' );
+				$best   = self::best_srcset_url( $srcset );
+				if ( '' !== $best ) {
+					$images[] = $best;
+				}
+			}
+		}
+
+		// 4. Embedded JSON blobs (data-props / application/json).
+		if ( empty( $images ) ) {
+			foreach ( $xpath->query( '//*[@data-props]' ) as $node ) {
+				$raw = trim( $node->getAttribute( 'data-props' ) );
+				if ( '' !== $raw ) {
+					$images = array_merge( $images, self::collect_json_images( $raw ) );
+				}
+			}
+			foreach ( $xpath->query( '//script[@type="application/json"]' ) as $node ) {
+				$images = array_merge( $images, self::collect_json_images( trim( $node->nodeValue ) ) );
+			}
+		}
+
+		// 5. DOM gallery containers.
+		if ( empty( $images ) ) {
+			$images = self::fallback_images( $xpath );
+		}
+
+		return array_values( array_unique( array_filter( array_map( 'trim', $images ) ) ) );
+	}
+
+	/**
+	 * Recursively collect image URLs from a decoded JSON blob.
+	 *
+	 * @param string $json JSON string.
+	 * @return array
+	 */
+	private static function collect_json_images( $json ) {
+		$decoded = json_decode( $json, true );
+		if ( ! is_array( $decoded ) ) {
+			return array();
+		}
+		$out = array();
+		self::walk_json_images( $decoded, $out );
+		return $out;
+	}
+
+	/**
+	 * Recursively walk a JSON structure for URL-looking image values.
+	 *
+	 * @param mixed $node JSON node.
+	 * @param array $out  Accumulator.
+	 */
+	private static function walk_json_images( $node, &$out ) {
+		if ( ! is_array( $node ) ) {
+			return;
+		}
+		foreach ( $node as $key => $value ) {
+			if ( is_array( $value ) ) {
+				self::walk_json_images( $value, $out );
+				continue;
+			}
+			if ( ! is_string( $value ) ) {
+				continue;
+			}
+			$v = trim( $value );
+			if ( preg_match( '#^https?://[^\s"\']+\.(?:jpe?g|png|webp|gif|avif)(?:\?[^\s"\']*)?$#i', $v ) ) {
+				$out[] = $v;
+			}
+		}
+	}
+
+	/**
+	 * Pick the highest-resolution URL from an <img srcset> attribute.
+	 *
+	 * @param string $srcset srcset attribute value.
+	 * @return string
+	 */
+	private static function best_srcset_url( $srcset ) {
+		$best_url = '';
+		$best_w   = 0;
+		foreach ( preg_split( '/\s*,\s*/', (string) $srcset ) as $candidate ) {
+			$candidate = trim( $candidate );
+			if ( '' === $candidate ) {
+				continue;
+			}
+			$parts = preg_split( '/\s+/', $candidate );
+			$url   = $parts[0];
+			$w     = 0;
+			if ( isset( $parts[1] ) && preg_match( '/^(\d+)w$/', $parts[1], $m ) ) {
+				$w = (int) $m[1];
+			}
+			if ( '' !== $url && $w >= $best_w ) {
+				$best_w   = $w;
+				$best_url = $url;
+			}
+		}
+		return $best_url;
+	}
+
+	/**
+	 * Upgrade a low-resolution CDN image URL to its highest-quality variant.
+	 *
+	 * Notino serves the same image at several sizes — `order`/`order_2k` are
+	 * 2–3 KB placeholder thumbnails while `detail_main_hq` is the real photo.
+	 * Other CDNs are handled with a conservative width-query bump.
+	 *
+	 * @param string $url Image URL.
+	 * @return string
+	 */
+	private static function upgrade_image_url( $url ) {
+		$url = trim( (string) $url );
+		if ( '' === $url ) {
+			return $url;
+		}
+
+		$host = strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) );
+
+		// Notino: order/order_2k/lq/mq → detail_main_hq (real high-res photo).
+		if ( false !== strpos( $host, 'notinoimg.com' ) ) {
+			return (string) preg_replace( '#/(order_2k|order|detail_main_lq|detail_main_mq|detail_main_hq)/#', '/detail_main_hq/', $url );
+		}
+
+		// Generic: bump a small width query param (widely supported, safe).
+		if ( preg_match( '#([?&](?:w|width)=\d+)#', $url, $m ) ) {
+			$width = (int) preg_replace( '/\D/', '', $m[1] );
+			if ( $width > 0 && $width < 800 ) {
+				return str_replace( $m[1], preg_replace( '/\d+/', '1200', $m[1] ), $url );
+			}
+		}
+
+		return $url;
+	}
+
+	/**
+	 * Extract color swatches from the rendered HTML for the generic/universal
+	 * path, in the same shape the importer expects (mirrors the WooCommerce/Rey
+	 * scraper):
+	 *
+	 *   [ 'pa_shade' => [ 'name' => 'Shade', 'type' => 'rey_color',
+	 *                     'terms' => [ slug => ['name','slug','color'] ] ] ]
+	 *
+	 * Signals (in order):
+	 *   1. CSS-in-JS "color picker" (Notino): <li data-testid="color-picker-item">
+	 *      whose swatch circle carries `--<hash>-2: #RRGGBB`, with the term
+	 *      label in the same item ("shade 020N 30 ml" → "020N").
+	 *   2. Generic: an element with an inline background hex AND a
+	 *      data-value / data-title attribute naming the term.
+	 *
+	 * @param DOMDocument $doc  Document.
+	 * @param DOMXPath    $xpath XPath instance.
+	 * @param array       $data Normalized product data (for the attribute label).
+	 * @return array
+	 */
+	private static function extract_swatches( $doc, $xpath, $data ) {
+		$label = 'Shade';
+		if ( ! empty( $data['variants'] ) && isset( $data['variants'][0]['attributes'] ) && is_array( $data['variants'][0]['attributes'] ) ) {
+			$keys = array_keys( $data['variants'][0]['attributes'] );
+			if ( ! empty( $keys ) ) {
+				$label = (string) $keys[0];
+			}
+		}
+
+		$terms = array();
+
+		// 1) Notino-style CSS-in-JS color picker. The shade LABEL is rendered
+		// in a separate tooltip portal (not inside the swatch <li>), so we
+		// join two maps by product ID:
+		//   - color-picker-item <a href=".../p-<id>/"> carries the swatch color
+		//   - JSON-LD offer "url" .../p-<id>/ + "name" ("... shade 020N ...")
+		$pid_to_color = array();
+		$items        = $xpath->query( '//*[@data-testid="color-picker-item"]' );
+		if ( $items && $items->length ) {
+			foreach ( $items as $item ) {
+				$frag  = $doc->saveHTML( $item );
+				$color = '';
+				if ( preg_match( '/--[a-zA-Z0-9]+-2\s*:\s*(#[0-9a-fA-F]{6})/', $frag, $m ) ) {
+					$color = $m[1];
+				}
+				$pid = '';
+				if ( preg_match( '/p-(\d+)/', $frag, $m ) ) {
+					$pid = $m[1];
+				}
+				if ( '' !== $pid && '' !== $color ) {
+					$pid_to_color[ $pid ] = $color;
+				}
+			}
+		}
+
+		if ( ! empty( $pid_to_color ) ) {
+			foreach ( self::flatten_jsonld( $xpath ) as $node ) {
+				$type = isset( $node['@type'] ) ? (array) $node['@type'] : array();
+				if ( ! in_array( 'Product', $type, true ) || empty( $node['offers'] ) ) {
+					continue;
+				}
+				$offers = isset( $node['offers'][0] ) ? $node['offers'] : array( $node['offers'] );
+				foreach ( $offers as $offer ) {
+					if ( ! is_array( $offer ) ) {
+						continue;
+					}
+					$name = isset( $offer['name'] ) ? (string) $offer['name'] : '';
+					if ( ! preg_match( '/shade\s+([A-Za-z0-9]+)/', $name, $m ) ) {
+						continue;
+					}
+					$shade = $m[1];
+					$url   = isset( $offer['url'] ) ? (string) $offer['url'] : ( isset( $offer['@id'] ) ? (string) $offer['@id'] : '' );
+					if ( ! preg_match( '/p-(\d+)/', $url, $pm ) ) {
+						continue;
+					}
+					$pid = $pm[1];
+					if ( ! isset( $pid_to_color[ $pid ] ) ) {
+						continue;
+					}
+					$slug           = wc_sanitize_taxonomy_name( $shade );
+					$terms[ $slug ] = array(
+						'name'  => $shade,
+						'slug'  => $slug,
+						'color' => $pid_to_color[ $pid ],
+					);
+				}
+				if ( ! empty( $terms ) ) {
+					break;
+				}
+			}
+		}
+
+		// 2) Generic inline-background swatches (only if #1 found nothing).
+		if ( empty( $terms ) ) {
+			foreach ( $xpath->query( '//*[@data-value or @data-title]' ) as $node ) {
+				$style = $node->getAttribute( 'style' );
+				$color = '';
+				if ( '' !== $style && preg_match( '/background(?:-color)?\s*:\s*(#[0-9a-fA-F]{6})/', $style, $m ) ) {
+					$color = $m[1];
+				}
+				$name = trim( $node->getAttribute( 'data-value' ) );
+				if ( '' === $name ) {
+					$name = trim( $node->getAttribute( 'data-title' ) );
+				}
+				if ( '' === $name || '' === $color ) {
+					continue;
+				}
+				$slug           = wc_sanitize_taxonomy_name( $name );
+				$terms[ $slug ] = array(
+					'name'  => $name,
+					'slug'  => $slug,
+					'color' => $color,
+				);
+			}
+		}
+
+		// 3) Headless / Magento-style embedded JSON: swatch colors live inside
+		// a `data-props` attribute (or <script type="application/json">) as an
+		// options array where each option has a `name` and an `after`/`html`
+		// fragment carrying `background-color: #HEX` (or an <img>).
+		if ( empty( $terms ) ) {
+			$json_candidates = array();
+			foreach ( $xpath->query( '//*[@data-props]' ) as $node ) {
+				$raw = trim( $node->getAttribute( 'data-props' ) );
+				if ( '' !== $raw ) {
+					$json_candidates[] = $raw;
+				}
+			}
+			foreach ( $xpath->query( '//script[@type="application/json"]' ) as $node ) {
+				$raw = trim( $node->nodeValue );
+				if ( '' !== $raw ) {
+					$json_candidates[] = $raw;
+				}
+			}
+			foreach ( $json_candidates as $raw ) {
+				$decoded = json_decode( $raw, true );
+				if ( ! is_array( $decoded ) ) {
+					continue;
+				}
+				$found = self::extract_swatches_from_json( $decoded );
+				if ( ! empty( $found ) ) {
+					$terms = $found;
+					break;
+				}
+			}
+		}
+
+		if ( empty( $terms ) ) {
+			return array();
+		}
+
+		$taxonomy = wc_attribute_taxonomy_name( $label );
+		$type     = 'rey_color';
+		// If any term has an image (and no color), this attribute is image-typed.
+		$any_image = false;
+		foreach ( $terms as $t ) {
+			if ( ! empty( $t['image'] ) && empty( $t['color'] ) ) {
+				$any_image = true;
+				break;
+			}
+		}
+		if ( $any_image ) {
+			$type = 'rey_image';
+		}
+
+		return array(
+			$taxonomy => array(
+				'name'  => $label,
+				'type'  => $type,
+				'terms' => $terms,
+			),
+		);
+	}
+
+	/**
+	 * Recursively walk a decoded JSON structure looking for a swatch "options"
+	 * list (a sequential array of items that each carry a name + a color/image).
+	 *
+	 * @param mixed $node  Decoded JSON node.
+	 * @param array $terms Accumulator (slug => {name,slug,color,image}).
+	 */
+	private static function walk_swatch_json( $node, &$terms ) {
+		if ( ! is_array( $node ) ) {
+			return;
+		}
+
+		// Sequential array → maybe an options list.
+		if ( isset( $node[0] ) && is_array( $node[0] ) ) {
+			$has_name  = false;
+			$has_visual = false;
+			foreach ( $node as $item ) {
+				if ( ! is_array( $item ) ) {
+					continue;
+				}
+				if ( '' !== self::find_swatch_name( $item ) ) {
+					$has_name = true;
+				}
+				if ( '' !== self::find_swatch_color( $item ) || '' !== self::find_swatch_image( $item ) ) {
+					$has_visual = true;
+				}
+			}
+
+			if ( $has_name && $has_visual ) {
+				foreach ( $node as $item ) {
+					if ( ! is_array( $item ) ) {
+						continue;
+					}
+					$clean = self::clean_variant_name( self::find_swatch_name( $item ) );
+					if ( '' === $clean ) {
+						continue;
+					}
+					$color = self::find_swatch_color( $item );
+					$image = self::find_swatch_image( $item );
+					if ( '' === $color && '' === $image ) {
+						continue;
+					}
+					$slug = wc_sanitize_taxonomy_name( $clean );
+					if ( ! isset( $terms[ $slug ] ) ) {
+						$terms[ $slug ] = array(
+							'name'  => $clean,
+							'slug'  => $slug,
+							'color' => $color,
+							'image' => $image,
+						);
+					}
+				}
+				return;
+			}
+
+			foreach ( $node as $item ) {
+				self::walk_swatch_json( $item, $terms );
+			}
+			return;
+		}
+
+		// Associative array → recurse into each value.
+		foreach ( $node as $value ) {
+			if ( is_array( $value ) ) {
+				self::walk_swatch_json( $value, $terms );
+			}
+		}
+	}
+
+	/**
+	 * Extract swatch terms from a decoded JSON blob (headless storefronts).
+	 *
+	 * @param array $json Decoded JSON.
+	 * @return array slug => {name,slug,color,image}.
+	 */
+	private static function extract_swatches_from_json( $json ) {
+		$terms = array();
+		self::walk_swatch_json( $json, $terms );
+		return $terms;
+	}
+
+	/**
+	 * Resolve a swatch option's display name from common key names.
+	 *
+	 * @param array $item Option item.
+	 * @return string
+	 */
+	private static function find_swatch_name( $item ) {
+		foreach ( array( 'name', 'label', 'title', 'swatch_name', 'value_name' ) as $k ) {
+			if ( isset( $item[ $k ] ) && is_scalar( $item[ $k ] ) && '' !== trim( (string) $item[ $k ] ) ) {
+				return (string) $item[ $k ];
+			}
+		}
+		return '';
+	}
+
+	/**
+	 * Resolve a swatch color from an option item (direct color-ish key, or an
+	 * embedded `background-color: #HEX` fragment).
+	 *
+	 * @param array $item Option item.
+	 * @return string Hex color (uppercase) or ''.
+	 */
+	private static function find_swatch_color( $item ) {
+		foreach ( array( 'color', 'swatch_color', 'background_color', 'hex', 'hex_color' ) as $k ) {
+			if ( isset( $item[ $k ] ) && is_string( $item[ $k ] ) ) {
+				$c = strtolower( trim( $item[ $k ] ) );
+				if ( '0x' === substr( $c, 0, 2 ) ) {
+					$c = '#' . substr( $c, 2 );
+				}
+				if ( preg_match( '/^#[0-9a-f]{6}$/', $c ) ) {
+					return strtoupper( $c );
+				}
+			}
+		}
+		foreach ( $item as $v ) {
+			if ( is_scalar( $v ) && preg_match( '/background-color\s*:\s*(#[0-9a-fA-F]{6})/i', (string) $v, $m ) ) {
+				return strtoupper( $m[1] );
+			}
+		}
+		return '';
+	}
+
+	/**
+	 * Resolve a swatch image URL from an option item (direct image key, or an
+	 * embedded `background-image:url(...)` / `<img src>` fragment).
+	 *
+	 * @param array $item Option item.
+	 * @return string Image URL or ''.
+	 */
+	private static function find_swatch_image( $item ) {
+		foreach ( array( 'image', 'swatch_image', 'image_url', 'thumbnail', 'thumb' ) as $k ) {
+			if ( isset( $item[ $k ] ) && is_string( $item[ $k ] ) && preg_match( '#^https?://#i', trim( $item[ $k ] ) ) ) {
+				return trim( $item[ $k ] );
+			}
+		}
+		foreach ( $item as $v ) {
+			if ( ! is_scalar( $v ) ) {
+				continue;
+			}
+			$s = (string) $v;
+			if ( preg_match( '/background-image\s*:\s*url\([\"\']?([^\"\')]+)[\"\']?\)/i', $s, $m ) ) {
+				return $m[1];
+			}
+			if ( preg_match( '/<img[^>]+src=[\"\']([^\"\']+)[\"\']/i', $s, $m ) ) {
+				return $m[1];
+			}
+		}
+		return '';
 	}
 
 	/**

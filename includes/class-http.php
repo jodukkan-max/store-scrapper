@@ -79,6 +79,16 @@ class SWI_HTTP {
 
 			$code = (int) $response['code'];
 
+			// Bot-protection challenge (Cloudflare "Just a moment…", DataDome,
+			// etc.)? When a JS-render proxy is configured, ask it to execute
+			// the page and return the rendered HTML instead of giving up.
+			if ( self::is_bot_challenge( $code, $response['headers'], $response['body'] ) ) {
+				$rendered = self::render_get( $current, $timeout );
+				if ( ! is_wp_error( $rendered ) ) {
+					return $rendered;
+				}
+			}
+
 			// Redirect: resolve and re-validate the Location header, then loop.
 			if ( in_array( $code, array( 301, 302, 303, 307, 308 ), true ) ) {
 				$location = self::header_value( $response['headers'], 'Location' );
@@ -263,6 +273,136 @@ class SWI_HTTP {
 		}
 
 		return self::normalize_url( $location );
+	}
+
+	/**
+	 * Whether a JS-rendering proxy is configured.
+	 *
+	 * @return bool
+	 */
+	public static function render_enabled() {
+		return '' !== trim( (string) SWI_Plugin::get_option( 'render_url', '' ) );
+	}
+
+	/**
+	 * Whether a response looks like a bot-protection challenge.
+	 *
+	 * Cloudflare's "managed challenge" returns 403/503 with a
+	 * `cf-mitigated: challenge` header and a "Just a moment…" body; DataDome
+	 * returns 403 with a `#challenge` page. When detected we can fall back to
+	 * a JS renderer instead of erroring out with HTTP 403.
+	 *
+	 * @param int    $code    HTTP status code.
+	 * @param string $headers Raw header block.
+	 * @param string $body    Response body.
+	 * @return bool
+	 */
+	public static function is_bot_challenge( $code, $headers, $body ) {
+		if ( ! self::render_enabled() ) {
+			return false;
+		}
+
+		if ( ! in_array( (int) $code, array( 403, 503 ), true ) ) {
+			return false;
+		}
+
+		$headers = strtolower( (string) $headers );
+		if ( false !== strpos( $headers, 'cf-mitigated: challenge' ) ) {
+			return true;
+		}
+
+		$markers = array(
+			'__cf_chl',
+			'challenges.cloudflare.com',
+			'just a moment',
+			'performing security verification',
+			'datadome',
+			'captcha-delivery.com',
+		);
+
+		$body = (string) $body;
+		foreach ( $markers as $marker ) {
+			if ( false !== stripos( $body, $marker ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Fetch a URL through the configured JS-rendering proxy.
+	 *
+	 * Speaks the FlareSolverr-compatible JSON API (POST /v1,
+	 * `cmd: "request.get"`), which executes the page in a real browser and
+	 * solves bot challenges before returning the rendered HTML.
+	 *
+	 * @param string $url     Absolute URL.
+	 * @param int    $timeout Per-request timeout (seconds).
+	 * @return string|WP_Error Rendered HTML, or WP_Error.
+	 */
+	public static function render_get( $url, $timeout = 60 ) {
+		$endpoint = rtrim( (string) SWI_Plugin::get_option( 'render_url', '' ), '/' );
+		if ( '' === $endpoint ) {
+			return new WP_Error( 'swi_no_render', __( 'No render proxy is configured.', 'swi' ) );
+		}
+
+		$payload = array(
+			'cmd'        => 'request.get',
+			'url'        => $url,
+			'maxTimeout' => max( 20000, (int) $timeout * 1000 ),
+		);
+
+		$response = wp_remote_post(
+			$endpoint . '/v1',
+			array(
+				'timeout'     => (int) $timeout + 20,
+				'redirection' => 0,
+				'sslverify'   => (bool) (int) SWI_Plugin::get_option( 'sslverify', 1 ),
+				'headers'     => array( 'Content-Type' => 'application/json' ),
+				'body'        => wp_json_encode( $payload ),
+			)
+		);
+
+		if ( is_wp_error( $response ) ) {
+			return $response;
+		}
+
+		$code = (int) wp_remote_retrieve_response_code( $response );
+		if ( 200 !== $code ) {
+			return new WP_Error(
+				'swi_render_' . $code,
+				/* translators: %d: HTTP status code */
+				sprintf( __( 'The render proxy returned HTTP %d.', 'swi' ), $code )
+			);
+		}
+
+		$decoded = json_decode( wp_remote_retrieve_body( $response ), true );
+		if ( ! is_array( $decoded ) || empty( $decoded['solution'] ) ) {
+			return new WP_Error( 'swi_render_invalid', __( 'The render proxy returned an invalid response.', 'swi' ) );
+		}
+
+		$solution = $decoded['solution'];
+		if ( isset( $solution['status'] ) && (int) $solution['status'] >= 400 ) {
+			return new WP_Error(
+				'swi_render_http',
+				/* translators: %d: HTTP status code */
+				sprintf( __( 'The render proxy could not load the page (HTTP %d).', 'swi' ), (int) $solution['status'] )
+			);
+		}
+
+		if ( empty( $solution['response'] ) ) {
+			return new WP_Error( 'swi_render_empty', __( 'The render proxy returned an empty page.', 'swi' ) );
+		}
+
+		// Binary resources (sitemaps, .xml.gz) come back base64-encoded from the
+		// render proxy — decode so the caller gets the raw bytes.
+		if ( ! empty( $solution['encoding'] ) && 'base64' === $solution['encoding'] ) {
+			$raw = base64_decode( (string) $solution['response'], true );
+			return ( false === $raw ) ? '' : $raw;
+		}
+
+		return (string) $solution['response'];
 	}
 
 	/**

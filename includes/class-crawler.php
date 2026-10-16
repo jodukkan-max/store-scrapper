@@ -50,6 +50,141 @@ class SWI_Crawler {
 	}
 
 	/**
+	 * Discover up to $limit product URLs (bounded for the catalog UI so huge
+	 * stores don't hang the request).
+	 *
+	 * @param string $base_url Target store URL.
+	 * @param string $platform Platform slug.
+	 * @param int    $limit    Max product URLs to return (0 = no limit).
+	 * @return array|WP_Error
+	 */
+	public static function discover_limited( $base_url, $platform, $limit = 500 ) {
+		$base = rtrim( SWI_HTTP::normalize_url( $base_url ), '/' );
+		if ( is_wp_error( $base ) ) {
+			return $base;
+		}
+
+		$urls = array();
+
+		foreach ( self::candidate_sitemaps( $base, $platform ) as $sitemap ) {
+			$found = self::parse_sitemap_limited( $sitemap, 0, $limit );
+			$urls  = array_merge( $urls, $found );
+			if ( count( $found ) > 0 ) {
+				break;
+			}
+		}
+
+		if ( empty( $urls ) ) {
+			$urls = self::crawl_listings( $base, $platform );
+		}
+
+		$urls = self::filter_product_urls( $urls, $platform, $base );
+
+		// Deduplicate by product slug (last path segment) so multi-country
+		// stores (same product under /gb/en/, /al/sq/, …) show each product once.
+		$urls = self::dedupe_by_slug( $urls );
+
+		if ( $limit > 0 ) {
+			$urls = array_slice( $urls, 0, $limit );
+		}
+
+		if ( empty( $urls ) ) {
+			return new WP_Error( 'swi_no_products', __( 'No product URLs were discovered on this site.', 'swi' ) );
+		}
+
+		return $urls;
+	}
+
+	/**
+	 * Deduplicate product URLs by their slug (last non-empty path segment),
+	 * keeping the first occurrence (which is typically the store's primary
+	 * locale for multi-country sitemap indexes).
+	 *
+	 * @param array $urls Product URLs.
+	 * @return array
+	 */
+	private static function dedupe_by_slug( $urls ) {
+		$seen = array();
+		$out  = array();
+		foreach ( $urls as $u ) {
+			$path = (string) wp_parse_url( (string) $u, PHP_URL_PATH );
+			$seg  = array_values( array_filter( explode( '/', trim( $path, '/' ) ) ) );
+			$slug = end( $seg );
+			if ( '' === $slug ) {
+				$slug = $u;
+			}
+			if ( isset( $seen[ $slug ] ) ) {
+				continue;
+			}
+			$seen[ $slug ] = true;
+			$out[]         = $u;
+		}
+		return $out;
+	}
+
+	/**
+	 * Recursively parse a sitemap (or sitemap index) but STOP once $limit URLs
+	 * have been collected, so a store with dozens of product sitemaps doesn't
+	 * stall the catalog request.
+	 *
+	 * @param string $url    Sitemap URL.
+	 * @param int    $depth  Recursion depth.
+	 * @param int    $limit  Max URLs to collect.
+	 * @param array  $state  By-ref accumulator { count }.
+	 * @return array
+	 */
+	private static function parse_sitemap_limited( $url, $depth = 0, $limit = 500, &$state = null ) {
+		if ( null === $state ) {
+			$state = array( 'count' => 0, 'children' => 0 );
+		}
+		if ( $depth > 3 || $state['count'] >= $limit ) {
+			return array();
+		}
+
+		$body = SWI_HTTP::get_with_retry( $url );
+		if ( is_wp_error( $body ) ) {
+			return array();
+		}
+
+		$xml = self::sitemap_xml( $body );
+		if ( false === $xml ) {
+			return array();
+		}
+
+		// Sitemap index: recurse into child sitemaps until the limit is hit,
+		// or we've fetched too many children (huge multi-country indexes; a
+		// render-proxy fetch can take seconds, so cap hard to stay snappy).
+		if ( 'sitemapindex' === strtolower( $xml->getName() ) ) {
+			$locs = array();
+			foreach ( $xml->sitemap as $child ) {
+				if ( $state['count'] >= $limit || $state['children'] >= 6 ) {
+					break;
+				}
+				$child_url = (string) $child->loc;
+				if ( $child_url ) {
+					$state['children']++;
+					$locs = array_merge( $locs, self::parse_sitemap_limited( $child_url, $depth + 1, $limit, $state ) );
+				}
+			}
+			return $locs;
+		}
+
+		$locs = array();
+		foreach ( $xml->url as $u ) {
+			if ( $state['count'] >= $limit ) {
+				break;
+			}
+			$loc = (string) $u->loc;
+			if ( $loc ) {
+				$locs[] = $loc;
+				$state['count']++;
+			}
+		}
+
+		return $locs;
+	}
+
+	/**
 	 * Fetch products in bulk from the platform's public JSON endpoint.
 	 *
 	 * This returns title, price, thumbnail and URL for every product in just a
@@ -198,12 +333,24 @@ class SWI_Crawler {
 			$currency = isset( $prices['currency_code'] ) ? (string) $prices['currency_code'] : '';
 		}
 
+		// Categories (for the folded-category list). Each entry: {id, name}.
+		$cats = array();
+		if ( ! empty( $p['categories'] ) && is_array( $p['categories'] ) ) {
+			foreach ( $p['categories'] as $c ) {
+				$cats[] = array(
+					'id'   => isset( $c['id'] ) ? (int) $c['id'] : 0,
+					'name' => isset( $c['name'] ) ? trim( (string) $c['name'] ) : '',
+				);
+			}
+		}
+
 		return array(
 			'source_url' => isset( $p['permalink'] ) ? (string) $p['permalink'] : '',
 			'title'      => isset( $p['name'] ) ? trim( (string) $p['name'] ) : '',
 			'thumbnail'  => $image,
 			'price'      => $price,
 			'currency'   => $currency,
+			'categories' => $cats,
 		);
 	}
 
@@ -234,13 +381,49 @@ class SWI_Crawler {
 
 		$handle = isset( $p['handle'] ) ? (string) $p['handle'] : '';
 
+		// Shopify has no category hierarchy in products.json; use product_type
+		// (e.g. "Shoes") as the single grouping key, and tags as a fallback.
+		$cats = array();
+		$type = isset( $p['product_type'] ) ? trim( (string) $p['product_type'] ) : '';
+		if ( '' !== $type ) {
+			$cats[] = array( 'id' => 0, 'name' => $type );
+		}
+
 		return array(
 			'source_url' => $handle ? $base . '/products/' . $handle : '',
 			'title'      => isset( $p['title'] ) ? trim( (string) $p['title'] ) : '',
 			'thumbnail'  => $image,
 			'price'      => $price,
 			'currency'   => '',
+			'categories' => $cats,
 		);
+	}
+
+	/**
+	 * Fetch the WooCommerce category tree (id, name, parent, count) from the
+	 * public Store API. Returns [] when unavailable (generic/Shopify).
+	 *
+	 * @param string $base Normalized base URL.
+	 * @return array
+	 */
+	public static function woocommerce_categories( $base ) {
+		$base    = rtrim( SWI_HTTP::normalize_url( $base ), '/' );
+		$data    = SWI_HTTP::get_json( add_query_arg( array( 'per_page' => 100 ), $base . '/wp-json/wc/store/products/categories' ) );
+		if ( is_wp_error( $data ) || ! is_array( $data ) ) {
+			return array();
+		}
+
+		$cats = array();
+		foreach ( $data as $c ) {
+			$cats[] = array(
+				'id'     => isset( $c['id'] ) ? (int) $c['id'] : 0,
+				'name'   => isset( $c['name'] ) ? trim( (string) $c['name'] ) : '',
+				'parent' => isset( $c['parent'] ) ? (int) $c['parent'] : 0,
+				'count'  => isset( $c['count'] ) ? (int) $c['count'] : 0,
+			);
+		}
+
+		return $cats;
 	}
 
 	/**
@@ -270,6 +453,34 @@ class SWI_Crawler {
 	}
 
 	/**
+	 * Parse a sitemap body into a SimpleXMLElement, transparently gunzipping
+	 * `.xml.gz` sitemaps (which many sites — incl. Magento/headless — use).
+	 *
+	 * @param string $body Raw response body.
+	 * @return SimpleXMLElement|false
+	 */
+	private static function sitemap_xml( $body ) {
+		$body = (string) $body;
+		if ( '' === $body ) {
+			return false;
+		}
+
+		// gzip magic bytes 1f 8b.
+		if ( "\x1f\x8b" === substr( $body, 0, 2 ) ) {
+			$decoded = function_exists( 'gzdecode' ) ? @gzdecode( $body ) : false;
+			if ( false !== $decoded ) {
+				$body = $decoded;
+			}
+		}
+
+		libxml_use_internal_errors( true );
+		$xml = simplexml_load_string( $body );
+		libxml_clear_errors();
+
+		return $xml;
+	}
+
+	/**
 	 * Recursively parse a sitemap (or sitemap index) and return <loc> URLs.
 	 *
 	 * @param string $url   Sitemap URL.
@@ -286,10 +497,7 @@ class SWI_Crawler {
 			return array();
 		}
 
-		libxml_use_internal_errors( true );
-		$xml = simplexml_load_string( $body );
-		libxml_clear_errors();
-
+		$xml = self::sitemap_xml( $body );
 		if ( false === $xml ) {
 			return array();
 		}

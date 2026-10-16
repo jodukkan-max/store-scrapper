@@ -64,6 +64,28 @@ class SWI_Profile {
 	}
 
 	/**
+	 * Derive a base URL (scheme://host) from a full URL or domain.
+	 *
+	 * @param string $domain_or_url Domain or full URL.
+	 * @return string scheme://host (no trailing slash), or ''.
+	 */
+	public static function base_url( $domain_or_url ) {
+		$value = trim( (string) $domain_or_url );
+		if ( '' === $value ) {
+			return '';
+		}
+		if ( false === strpos( $value, '://' ) ) {
+			$value = 'https://' . $value;
+		}
+		$parts = wp_parse_url( $value );
+		if ( empty( $parts['host'] ) ) {
+			return '';
+		}
+		$scheme = isset( $parts['scheme'] ) ? $parts['scheme'] : 'https';
+		return $scheme . '://' . $parts['host'];
+	}
+
+	/**
 	 * Option key holding every saved profile (single option, keyed by domain).
 	 *
 	 * @return string
@@ -162,6 +184,7 @@ class SWI_Profile {
 		$out = array(
 			'version'    => self::VERSION,
 			'domain'     => isset( $profile['domain'] ) ? self::normalize_domain( $profile['domain'] ) : '',
+			'base_url'   => isset( $profile['base_url'] ) ? (string) $profile['base_url'] : '',
 			'trained_at' => isset( $profile['trained_at'] ) ? (string) $profile['trained_at'] : current_time( 'c' ),
 			'samples'    => isset( $profile['samples'] ) && is_array( $profile['samples'] ) ? $profile['samples'] : array(),
 			'fields'     => array(),
@@ -198,7 +221,19 @@ class SWI_Profile {
 
 			if ( ! empty( $profile['variable']['variants'] ) && is_array( $profile['variable']['variants'] ) ) {
 				$variants  = $profile['variable']['variants'];
-				$vstrategy = isset( $variants['strategy'] ) ? (string) $variants['strategy'] : '';
+				$vstrategy = isset( $variants['strategy'] ) ? strtolower( (string) $variants['strategy'] ) : '';
+
+				// Normalize: the AI sometimes writes an `attribute_mode`
+				// ("name_attr", "title_split", "option_fields", "attributes_map")
+				// as the top-level strategy. Those are modes, not strategies —
+				// the correct strategy is always "embedded_json". Rewrite it so
+				// the profile is accepted instead of hard-failing.
+				$modes = array( 'name_attr', 'title_split', 'option_fields', 'attributes_map' );
+				if ( in_array( $vstrategy, $modes, true ) ) {
+					$variants['attribute_mode'] = $vstrategy;
+					$variants['strategy']       = 'embedded_json';
+					$vstrategy                  = 'embedded_json';
+				}
 
 				if ( ! in_array( $vstrategy, self::$variant_strategies, true ) ) {
 					return new WP_Error(
