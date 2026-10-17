@@ -1,6 +1,6 @@
 {
-  "version": "1.6.12",
-  "package": "https://github.com/jodukkan-max/store-scrapper/releases/download/v1.6.12/store-scrapper.zip",
+  "version": "1.6.13",
+  "package": "https://github.com/jodukkan-max/store-scrapper/releases/download/v1.6.13/store-scrapper.zip",
   "requires": "5.0",
   "tested": "6.6"
 }

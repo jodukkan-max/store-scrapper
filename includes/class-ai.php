@@ -169,6 +169,12 @@ class SWI_AI {
 	private static function audit_extraction( $data, $expect_variants, $sample_html = '' ) {
 		$problems = array();
 
+		// Ground-truth signals (independent of any AI guess): what the page
+		// actually declares via JSON-LD offers / hasVariant / color picker.
+		$gt = ( '' !== (string) $sample_html ) ? SWI_Generic_Scraper::ground_truth( (string) $sample_html ) : array();
+		$gt_variants = max( (int) ( isset( $gt['offers_count'] ) ? $gt['offers_count'] : 0 ), (int) ( isset( $gt['has_variant_count'] ) ? $gt['has_variant_count'] : 0 ) );
+		$gt_swatches = (int) ( isset( $gt['swatch_items'] ) ? $gt['swatch_items'] : 0 );
+
 		if ( '' === trim( (string) $data['title'] ) ) {
 			$problems[] = 'empty title (check JSON-LD "name", <title>, og:title)';
 		}
@@ -178,8 +184,27 @@ class SWI_AI {
 		if ( empty( $data['images'] ) ) {
 			$problems[] = 'no images extracted (check JSON-LD "image" array, og:image, gallery <img> src/srcset)';
 		}
-		if ( $expect_variants && ( 'variable' !== $data['type'] || empty( $data['variants'] ) ) ) {
+
+		// Ground-truth variant count check: when the page declares N offers
+		// (or hasVariant), the scraper MUST produce N variants — not 0, not N-1.
+		$scraped_variants = ( 'variable' === $data['type'] && ! empty( $data['variants'] ) ) ? count( $data['variants'] ) : 0;
+		if ( $expect_variants && 0 === $scraped_variants ) {
 			$problems[] = '0 variants from a variable sample (use detection jsonld_offers when Product "offers" has >1; extract via embedded_json json_path "offers" attribute_mode name_attr — NEVER chase __APOLLO_STATE__/CatalogVariant __ref pointers)';
+		} elseif ( $gt_variants > 0 && $scraped_variants !== $gt_variants ) {
+			$problems[] = 'variant count mismatch: page declares ' . $gt_variants . ' variants (JSON-LD offers/hasVariant) but scraper produced ' . $scraped_variants . ' — extract ALL offers, not a subset';
+		}
+
+		// Ground-truth swatch count check.
+		if ( $gt_swatches > 0 ) {
+			$swatch_terms = 0;
+			if ( ! empty( $data['swatches'] ) && is_array( $data['swatches'] ) ) {
+				foreach ( $data['swatches'] as $swatch ) {
+					$swatch_terms += isset( $swatch['terms'] ) && is_array( $swatch['terms'] ) ? count( $swatch['terms'] ) : 0;
+				}
+			}
+			if ( $swatch_terms !== $gt_swatches ) {
+				$problems[] = 'swatch count mismatch: page shows ' . $gt_swatches . ' color swatches but scraper produced ' . $swatch_terms . ' — extract every color-picker item (including the "selected" one, data-testid="color-picker-item-selected")';
+			}
 		}
 
 		// SWATCH audit — the failure mode that slipped through before: variants
@@ -431,9 +456,20 @@ class SWI_AI {
 			'You may use tools to investigate the HTML before finalizing. Every response must be a single JSON object (no markdown) with exactly one of these shapes:',
 			'  {"action":"final","profile":{...}}',
 			'  {"action":"tool","tool":"sources"}',
+			'  {"action":"tool","tool":"dump_jsonld"}',
 			'  {"action":"tool","tool":"search_html","pattern":"<regex>","field":"<one-word reason>"}',
+			'  {"action":"tool","tool":"test_selector","selector":"<css>","attribute":"<optional attr>"}',
+			'  {"action":"tool","tool":"test_regex","pattern":"<regex>"}',
 			'  {"action":"tool","tool":"run_profile","profile":{...}}',
 			'  {"action":"tool","tool":"inspect","field":"<title|price|images|swatches|variants|description|sku|categories>"}',
+			'',
+			'WORKFLOW (follow this order — do not jump to "final"):',
+			'  1. dump_jsonld — see the ACTUAL schema.org Product/ProductGroup/BreadcrumbList data (names, offers, prices, skus, images, hasVariant).',
+			'  2. If you need a CSS selector or regex, TEST it first with test_selector / test_regex / search_html.',
+			'  3. Build a profile and RUN it with run_profile to see what it actually extracts.',
+			'  4. Compare run_profile output to the dump_jsonld ground truth (same variant count? same names? swatches present?).',
+			'  5. Only when run_profile output is COMPLETE and CORRECT, return {"action":"final","profile":{...}}.',
+			'If you finalize and the system replies "still wrong", FIX the listed problems and finalize again — do not give up.',
 			'',
 			'FIELD RULES (use these strategies): meta / jsonld / jsonld_all / selector / selector_all / regex / null.',
 			'VARIANT STRATEGIES: productgroup / embedded_json / dom_options (with attribute_mode title_split|option_fields|attributes_map|name_attr).',
@@ -455,8 +491,9 @@ class SWI_AI {
 		);
 
 		$best_score = PHP_INT_MAX;
+		$max_turns  = 12; // adaptive: stops early on a verified-clean final.
 
-		for ( $turn = 0; $turn < 6; $turn++ ) {
+		for ( $turn = 0; $turn < $max_turns; $turn++ ) {
 			$reply = self::request_raw( array( 'messages' => $messages ) );
 			if ( is_wp_error( $reply ) ) {
 				break; // degrade to best profile.
@@ -472,14 +509,37 @@ class SWI_AI {
 			$messages[] = array( 'role' => 'assistant', 'content' => $text );
 
 			if ( 'final' === $msg['action'] ) {
-				if ( ! empty( $msg['profile'] ) && is_array( $msg['profile'] ) ) {
-					$valid = SWI_Profile::validate( $msg['profile'] );
-					if ( is_wp_error( $valid ) ) {
-						break;
-					}
-					return $valid;
+				if ( empty( $msg['profile'] ) || ! is_array( $msg['profile'] ) ) {
+					break;
 				}
-				break;
+				$valid = SWI_Profile::validate( $msg['profile'] );
+				if ( is_wp_error( $valid ) ) {
+					// Invalid profile — tell the model exactly what's wrong and
+					// let it retry instead of silently giving up.
+					$messages[] = array( 'role' => 'user', 'content' => 'Your profile is INVALID: ' . $valid->get_error_message() . ' Fix it and finalize again.' );
+					continue;
+				}
+
+				// VERIFY the "final" answer by actually running it — do not trust
+				// a self-declared "done". If it is still wrong, feed the exact
+				// problems back and keep looping.
+				$data = SWI_Generic_Scraper::scrape_html( $sample, $base_url, $valid );
+				if ( is_wp_error( $data ) ) {
+					$messages[] = array( 'role' => 'user', 'content' => 'Your profile crashed the scraper: ' . $data->get_error_message() . ' Fix it and finalize again.' );
+					continue;
+				}
+				$problems = self::audit_extraction( $data, $is_variable, $sample );
+				if ( empty( $problems ) ) {
+					return $valid; // verified clean.
+				}
+
+				// Keep the best we've seen, then push back.
+				if ( count( $problems ) < $best_score ) {
+					$best_score = count( $problems );
+					$best       = $valid;
+				}
+				$messages[] = array( 'role' => 'user', 'content' => 'Your profile was RUN and is STILL WRONG. Problems:\n- ' . implode( "\n- ", $problems ) . "\nUse dump_jsonld / run_profile to find the right rules, then finalize again." );
+				continue;
 			}
 
 			if ( 'tool' !== $msg['action'] || empty( $msg['tool'] ) ) {
@@ -564,6 +624,42 @@ class SWI_AI {
 				return 'No structured data sources detected (no JSON-LD, no relevant meta). Use search_html to locate fields in the raw HTML.';
 			}
 			return "SOURCE INVENTORY (which data sources exist in this HTML):\n" . $inv;
+		}
+
+		if ( 'dump_jsonld' === $tool ) {
+			$dump = SWI_Generic_Scraper::dump_jsonld( $sample );
+			return 'SCHEMA.ORG JSON-LD (the real data — build your profile from these paths):\n' . ( '' === $dump ? '[] (no JSON-LD found)' : $dump );
+		}
+
+		if ( 'test_selector' === $tool ) {
+			$css = isset( $msg['selector'] ) ? (string) $msg['selector'] : '';
+			if ( '' === $css ) {
+				return 'ERROR: test_selector requires a "selector".';
+			}
+			$attr = isset( $msg['attribute'] ) ? (string) $msg['attribute'] : '';
+			return SWI_Generic_Scraper::test_css_selector( $sample, $css, $attr );
+		}
+
+		if ( 'test_regex' === $tool ) {
+			$pattern = isset( $msg['pattern'] ) ? (string) $msg['pattern'] : '';
+			if ( '' === $pattern ) {
+				return 'ERROR: test_regex requires a "pattern".';
+			}
+			$count = @preg_match_all( $pattern, $sample, $matches, PREG_SET_ORDER );
+			if ( false === $count || 0 === $count ) {
+				return 'No matches found.';
+			}
+			$snippets = array();
+			foreach ( array_slice( $matches, 0, 5 ) as $m ) {
+				$groups = array();
+				foreach ( $m as $i => $g ) {
+					if ( $i > 0 ) {
+						$groups[] = 'group' . $i . '=' . substr( (string) $g, 0, 120 );
+					}
+				}
+				$snippets[] = 'full=' . substr( (string) $m[0], 0, 120 ) . ( $groups ? ' | ' . implode( ' | ', $groups ) : '' );
+			}
+			return 'Found ' . $count . " matches. Samples:\n" . implode( "\n---\n", $snippets );
 		}
 
 		if ( 'inspect' === $tool ) {

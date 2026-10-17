@@ -790,6 +790,138 @@ class SWI_Generic_Scraper {
 	}
 
 	/**
+	 * Deterministic ground-truth signals for a page, used to VERIFY a scraped
+	 * result (not to guess it). This is the "oracle" the self-verification loop
+	 * compares against: how many variants the page really declares (JSON-LD
+	 * offers / ProductGroup.hasVariant) and how many color swatches it really
+	 * shows (color-picker items), independent of any AI-generated profile.
+	 *
+	 * @param string $html Raw HTML.
+	 * @return array {offers_count, has_variant_count, swatch_items, has_swatch_signal}.
+	 */
+	public static function ground_truth( $html ) {
+		$gt = array(
+			'offers_count'      => 0,
+			'has_variant_count' => 0,
+			'swatch_items'      => 0,
+			'has_swatch_signal' => false,
+		);
+
+		$doc = self::load_dom( $html );
+		if ( is_wp_error( $doc ) ) {
+			return $gt;
+		}
+		$xpath = new DOMXPath( $doc );
+
+		foreach ( self::flatten_jsonld( $xpath ) as $node ) {
+			$types = isset( $node['@type'] ) ? ( is_array( $node['@type'] ) ? $node['@type'] : array( $node['@type'] ) ) : array();
+			foreach ( $types as $t ) {
+				$t = (string) $t;
+				if ( 'Product' === $t ) {
+					$offers = isset( $node['offers'] ) && is_array( $node['offers'] ) ? ( isset( $node['offers'][0] ) ? count( $node['offers'] ) : 1 ) : 0;
+					if ( $offers > $gt['offers_count'] ) {
+						$gt['offers_count'] = $offers;
+					}
+				}
+				if ( 'ProductGroup' === $t ) {
+					$hv = isset( $node['hasVariant'] ) && is_array( $node['hasVariant'] ) ? ( isset( $node['hasVariant'][0] ) ? count( $node['hasVariant'] ) : 1 ) : 0;
+					if ( $hv > $gt['has_variant_count'] ) {
+						$gt['has_variant_count'] = $hv;
+					}
+				}
+			}
+		}
+
+		$items = $xpath->query( '//*[starts-with(@data-testid, "color-picker-item")]' );
+		if ( $items && $items->length ) {
+			$gt['swatch_items']      = (int) $items->length;
+			$gt['has_swatch_signal'] = true;
+		}
+		if ( ! $gt['has_swatch_signal'] ) {
+			if ( false !== stripos( $html, 'swatch' ) ) {
+				$gt['has_swatch_signal'] = true;
+			}
+			if ( preg_match( '/--[a-zA-Z0-9]+-2\s*:\s*(#[0-9a-fA-F]{6})/', $html ) ) {
+				$gt['has_swatch_signal'] = true;
+			}
+		}
+
+		return $gt;
+	}
+
+	/**
+	 * Dump the schema.org JSON-LD nodes (Product / ProductGroup / BreadcrumbList)
+	 * as pretty JSON — the agent's primary "see the real data" tool. Knowing the
+	 * actual offers/hasVariant structure is what stops it chasing a GraphQL
+	 * __APOLLO_STATE__ cache.
+	 *
+	 * @param string $html Raw HTML.
+	 * @return string JSON array (or '[]').
+	 */
+	public static function dump_jsonld( $html ) {
+		$doc = self::load_dom( $html );
+		if ( is_wp_error( $doc ) ) {
+			return '[]';
+		}
+		$xpath = new DOMXPath( $doc );
+		$nodes = self::flatten_jsonld( $xpath );
+		if ( empty( $nodes ) ) {
+			return '[]';
+		}
+
+		$keep = array();
+		foreach ( $nodes as $node ) {
+			$types = isset( $node['@type'] ) ? ( is_array( $node['@type'] ) ? $node['@type'] : array( $node['@type'] ) ) : array();
+			foreach ( $types as $t ) {
+				if ( in_array( (string) $t, array( 'Product', 'ProductGroup', 'BreadcrumbList' ), true ) ) {
+					$keep[] = $node;
+					break;
+				}
+			}
+		}
+		if ( empty( $keep ) ) {
+			$keep = array_slice( $nodes, 0, 5 );
+		}
+
+		return (string) wp_json_encode( $keep, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT );
+	}
+
+	/**
+	 * Test a CSS selector against the HTML and return the match count + samples
+	 * (text and/or an attribute value). The agent's "verify my selector" tool.
+	 *
+	 * @param string $html      Raw HTML.
+	 * @param string $css       CSS selector.
+	 * @param string $attribute Optional attribute name to read off each match.
+	 * @return string Human-readable result.
+	 */
+	public static function test_css_selector( $html, $css, $attribute = '' ) {
+		$doc = self::load_dom( $html );
+		if ( is_wp_error( $doc ) ) {
+			return 'ERROR: could not parse HTML.';
+		}
+		$xpath = new DOMXPath( $doc );
+		$found = $xpath->query( self::css_to_xpath( $css ) );
+		if ( ! $found || 0 === $found->length ) {
+			return '0 matches.';
+		}
+
+		$out = array();
+		$n   = min( 5, $found->length );
+		for ( $i = 0; $i < $n; $i++ ) {
+			$node = $found->item( $i );
+			$text = trim( (string) $node->nodeValue );
+			$val  = '';
+			if ( '' !== $attribute && $node instanceof DOMElement ) {
+				$val = (string) $node->getAttribute( $attribute );
+			}
+			$out[] = ( '' !== $val ? "attr[$attribute]=" . $val : '' ) . ( '' !== $text ? ( '' !== $val ? ' | ' : '' ) . 'text=' . substr( $text, 0, 120 ) : '' );
+		}
+
+		return $found->length . " matches. Samples:\n" . implode( "\n", $out );
+	}
+
+	/**
 	 * Recursively collect JSON-LD nodes carrying an @type key.
 	 *
 	 * @param mixed $data  Decoded JSON.
