@@ -138,7 +138,7 @@ class SWI_AI {
 			if ( is_wp_error( $data ) ) {
 				$problems[] = 'scraper error: ' . $data->get_error_message();
 			} else {
-				$problems = self::audit_extraction( $data, $is_variable );
+				$problems = self::audit_extraction( $data, $is_variable, $sample );
 			}
 
 			$score = count( $problems );
@@ -161,11 +161,12 @@ class SWI_AI {
 	 * Inspect an extraction result and list the concrete problems, so the AI
 	 * can be told exactly which rules to fix.
 	 *
-	 * @param array $data            Normalized product data.
-	 * @param bool  $expect_variants Whether the sample was a variable product.
+	 * @param array  $data            Normalized product data.
+	 * @param bool   $expect_variants Whether the sample was a variable product.
+	 * @param string $sample_html     Raw sample HTML (for swatch-source signals).
 	 * @return array
 	 */
-	private static function audit_extraction( $data, $expect_variants ) {
+	private static function audit_extraction( $data, $expect_variants, $sample_html = '' ) {
 		$problems = array();
 
 		if ( '' === trim( (string) $data['title'] ) ) {
@@ -179,6 +180,45 @@ class SWI_AI {
 		}
 		if ( $expect_variants && ( 'variable' !== $data['type'] || empty( $data['variants'] ) ) ) {
 			$problems[] = '0 variants from a variable sample (use detection jsonld_offers when Product "offers" has >1; extract via embedded_json json_path "offers" attribute_mode name_attr — NEVER chase __APOLLO_STATE__/CatalogVariant __ref pointers)';
+		}
+
+		// SWATCH audit — the failure mode that slipped through before: variants
+		// were correct but swatch terms did NOT match the variation values, so
+		// the storefront rendered no color swatches. Check it deterministically.
+		$variants = isset( $data['variants'] ) && is_array( $data['variants'] ) ? $data['variants'] : array();
+		$swatches = isset( $data['swatches'] ) && is_array( $data['swatches'] ) ? $data['swatches'] : array();
+
+		if ( ! empty( $variants ) && ! empty( $swatches ) ) {
+			foreach ( $variants as $variant ) {
+				foreach ( (array) $variant['attributes'] as $value ) {
+					$value = trim( (string) $value );
+					if ( '' === $value ) {
+						continue;
+					}
+					$matched = false;
+					foreach ( $swatches as $swatch ) {
+						foreach ( (array) $swatch['terms'] as $slug => $term ) {
+							$tname = isset( $term['name'] ) ? trim( (string) $term['name'] ) : '';
+							if ( $tname === $value || (string) $slug === wc_sanitize_taxonomy_name( $value ) ) {
+								$matched = true;
+								break 2;
+							}
+						}
+					}
+					if ( ! $matched ) {
+						$problems[] = 'swatch term missing/mismatched for variation value "' . $value . '" — swatch term names must EXACTLY equal the variation values (derive both from the same offer-name parser; do not truncate to the first word)';
+					}
+				}
+			}
+		} elseif ( ! empty( $variants ) && '' !== (string) $sample_html ) {
+			// Variants exist but no swatches — flag it only when the source page
+			// actually carries swatch signals (color picker / inline color).
+			$has_swatch_signal = ( false !== stripos( (string) $sample_html, 'color-picker' ) )
+				|| ( false !== stripos( (string) $sample_html, 'swatch' ) )
+				|| ( 1 === preg_match( '/--[a-zA-Z0-9]+-2\s*:\s*(#[0-9a-fA-F]{6})/', (string) $sample_html ) );
+			if ( $has_swatch_signal ) {
+				$problems[] = 'color swatches present in source HTML but none extracted — extract per-variant colors from the color picker / swatch element (inline or CSS-in-JS custom-property hex)';
+			}
 		}
 
 		return $problems;
@@ -380,7 +420,7 @@ class SWI_AI {
 		// If the bootstrap already produced a clean profile, don't pay for the
 		// agent loop.
 		$data = SWI_Generic_Scraper::scrape_html( $sample, $base_url, $best );
-		if ( ! is_wp_error( $data ) && empty( self::audit_extraction( $data, $is_variable ) ) ) {
+		if ( ! is_wp_error( $data ) && empty( self::audit_extraction( $data, $is_variable, $sample ) ) ) {
 			return $best;
 		}
 
@@ -455,7 +495,7 @@ class SWI_AI {
 				$valid = SWI_Profile::validate( $msg['profile'] );
 				if ( ! is_wp_error( $valid ) ) {
 					$data  = SWI_Generic_Scraper::scrape_html( $sample, $base_url, $valid );
-					$score = is_wp_error( $data ) ? PHP_INT_MAX : count( self::audit_extraction( $data, $is_variable ) );
+					$score = is_wp_error( $data ) ? PHP_INT_MAX : count( self::audit_extraction( $data, $is_variable, $sample ) );
 					if ( $score < $best_score ) {
 						$best_score = $score;
 						$best       = $valid;
